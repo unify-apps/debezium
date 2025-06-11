@@ -5,10 +5,8 @@
  */
 package io.debezium.connector.oracle.logminer;
 
-import static io.debezium.connector.oracle.logminer.LogMinerHelper.logError;
-import static io.debezium.connector.oracle.logminer.LogMinerHelper.setLogFilesForMining;
-
 import java.math.BigInteger;
+import java.sql.CallableStatement;
 import java.sql.SQLException;
 import java.text.DecimalFormat;
 import java.time.Duration;
@@ -77,6 +75,7 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
     private final Duration archiveLogRetention;
     private final boolean archiveLogOnlyMode;
     private final String archiveDestinationName;
+    private final LogFileCollector logCollector;
     private final int logFileQueryMaxRetries;
     private final Duration initialDelay;
     private final Duration maxDelay;
@@ -107,6 +106,7 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
         this.logFileQueryMaxRetries = connectorConfig.getMaximumNumberOfLogQueryRetries();
         this.initialDelay = connectorConfig.getLogMiningInitialDelay();
         this.maxDelay = connectorConfig.getLogMiningMaxDelay();
+        this.logCollector = new LogFileCollector(connectorConfig, jdbcConnection);
     }
 
     /**
@@ -218,7 +218,8 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
             }
         }
         catch (Throwable t) {
-            logError(streamingMetrics, "Mining session stopped due to the {}", t);
+            LOGGER.error("Mining session stopped due to error.", t);
+            streamingMetrics.incrementErrorCount();
             errorHandler.setProducerThrowable(t);
         }
         finally {
@@ -327,25 +328,26 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
 
     private void initializeRedoLogsForMining(OracleConnection connection, boolean postEndMiningSession, Scn startScn)
             throws SQLException {
-        if (!postEndMiningSession) {
-            if (OracleConnectorConfig.LogMiningStrategy.CATALOG_IN_REDO.equals(strategy)) {
-                buildDataDictionary(connection);
-            }
-            if (!isContinuousMining) {
-                currentLogFiles = setLogFilesForMining(connection, startScn, archiveLogRetention, archiveLogOnlyMode,
-                        archiveDestinationName, logFileQueryMaxRetries, initialDelay, maxDelay);
-                currentRedoLogSequences = getCurrentLogFileSequences(currentLogFiles);
-            }
+
+        if (!isContinuousMining) {
+            connection.removeAllLogFilesFromLogMinerSession();
         }
-        else {
-            if (!isContinuousMining) {
-                if (OracleConnectorConfig.LogMiningStrategy.CATALOG_IN_REDO.equals(strategy)) {
-                    buildDataDictionary(connection);
+        if ((!postEndMiningSession || !isContinuousMining)
+                && OracleConnectorConfig.LogMiningStrategy.CATALOG_IN_REDO.equals(strategy)) {
+            buildDataDictionary(connection);
+        }
+
+        if (!isContinuousMining) {
+            // Collect logs and add them to the session
+            currentLogFiles = logCollector.getLogs(startScn);
+            for (LogFile logFile : currentLogFiles) {
+                LOGGER.trace("Adding log file {} to the mining session.", logFile.getFileName());
+                String addLogFileStatement = SqlUtils.addLogFileStatement("DBMS_LOGMNR.ADDFILE", logFile.getFileName());
+                try (CallableStatement statement = connection.connection(false).prepareCall(addLogFileStatement)) {
+                    statement.execute();
                 }
-                currentLogFiles = setLogFilesForMining(connection, startScn, archiveLogRetention, archiveLogOnlyMode,
-                        archiveDestinationName, logFileQueryMaxRetries, initialDelay, maxDelay);
-                currentRedoLogSequences = getCurrentLogFileSequences(currentLogFiles);
             }
+            currentRedoLogSequences = getCurrentLogFileSequences(currentLogFiles);
         }
 
         updateRedoLogMetrics();
@@ -868,9 +870,11 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
      * @throws SQLException if a database exception occurred
      */
     private boolean isStartScnInArchiveLogs(Scn startScn) throws SQLException {
-        List<LogFile> logs = LogMinerHelper.getLogFilesForOffsetScn(jdbcConnection, startScn, archiveLogRetention, archiveLogOnlyMode, archiveDestinationName);
+        List<LogFile> logs = logCollector.getLogs(startScn);
         return logs.stream()
-                .anyMatch(l -> l.getFirstScn().compareTo(startScn) <= 0 && l.getNextScn().compareTo(startScn) > 0 && l.getType().equals(LogFile.Type.ARCHIVE));
+                .anyMatch(l -> l.getFirstScn().compareTo(startScn) <= 0
+                        && l.getNextScn().compareTo(startScn) > 0
+                        && l.getType().equals(LogFile.Type.ARCHIVE));
     }
 
     @Override
