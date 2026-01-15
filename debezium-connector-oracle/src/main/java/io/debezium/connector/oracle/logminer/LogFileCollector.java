@@ -169,16 +169,14 @@ public class LogFileCollector {
      */
     @VisibleForTesting
     public boolean isLogFileListConsistent(Scn startScn, List<LogFile> logs, RedoThreadState currentRedoThreadState) {
-        if (LOGGER.isDebugEnabled()) {
-            LOGGER.debug("Performing consistency check on the following collected logs:");
-            for (LogFile logFile : logs) {
-                LOGGER.debug("\tLog: {}", logFile);
-            }
+        LOGGER.info("Performing consistency check on the following collected logs:");
+        for (LogFile logFile : logs) {
+            LOGGER.info("\tLog: {}", logFile);
+        }
 
-            LOGGER.debug("Current redo thread state:");
-            for (RedoThread redoThread : currentRedoThreadState.getThreads()) {
-                LOGGER.debug("\tThread: {}", redoThread);
-            }
+        LOGGER.info("Current redo thread state:");
+        for (RedoThread redoThread : currentRedoThreadState.getThreads()) {
+            LOGGER.info("\tThread: {}", redoThread);
         }
 
         // Generate a map of the logs by redo thread
