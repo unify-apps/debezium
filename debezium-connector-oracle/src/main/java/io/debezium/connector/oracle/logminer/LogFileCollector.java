@@ -295,14 +295,15 @@ public class LogFileCollector {
 
                         // We expect that there should be an archive log with a range just before startScn
                         // If this doesn't exist, we cannot guarantee there is not a gap in archive log sequences next
-                        if (logWithRangeBeforeStartScn.isEmpty()) {
+                        if (!logWithRangeBeforeStartScn.isPresent()) {
                             logException(String.format("Redo Thread %d is inconsistent; expected archive log with range just before scn %s.",
                                     threadId, startScn));
                             return false;
                         }
 
-                        final Optional<Long> missingSequence = getFirstLogMissingSequence(Stream.concat(
-                                threadLogs.stream(), logWithRangeBeforeStartScn.stream()).toList());
+                        List<LogFile> combinedLogs = new ArrayList<>(threadLogs);
+                        logWithRangeBeforeStartScn.ifPresent(combinedLogs::add);
+                        final Optional<Long> missingSequence = getFirstLogMissingSequence(combinedLogs);
                         if (missingSequence.isPresent()) {
                             logException(String.format("Redo Thread %d is inconsistent; an archive log with sequence %d is not available",
                                     threadId, missingSequence.get()));
