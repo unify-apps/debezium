@@ -5,6 +5,7 @@
  */
 package io.debezium.connector.oracle;
 
+import java.math.BigInteger;
 import java.sql.*;
 import java.time.Instant;
 import java.time.OffsetDateTime;
@@ -20,6 +21,7 @@ import java.util.function.Supplier;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
+import io.debezium.connector.oracle.logminer.LogFile;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -606,6 +608,33 @@ public class OracleConnection extends JdbcConnection {
         }
         catch (SQLException e) {
             throw new DebeziumException("Failed to read the Oracle database redo thread state", e);
+        }
+    }
+
+    public LogFile getArchiveLogFile(int threadId, long sequenceId) {
+        try {
+            return prepareQueryAndMap(
+                    "SELECT NAME, FIRST_CHANGE#, NEXT_CHANGE#, SEQUENCE# FROM V$ARCHIVED_LOG WHERE THREAD#=? AND SEQUENCE#=?",
+                    ps -> {
+                        ps.setInt(1, threadId);
+                        ps.setLong(2, sequenceId);
+                    },
+                    rs -> {
+                        if (!rs.next()) {
+                            return null;
+                        }
+                        return new LogFile(
+                                rs.getString(1),
+                                Scn.valueOf(rs.getString(2)),
+                                Scn.valueOf(rs.getString(3)),
+                                BigInteger.valueOf(rs.getLong(4)),
+                                LogFile.Type.ARCHIVE,
+                                threadId);
+                    });
+        }
+        catch (SQLException e) {
+            LOGGER.warn("Failed to find archive log for redo thread {} and sequence {}", threadId, sequenceId, e);
+            return null;
         }
     }
 
