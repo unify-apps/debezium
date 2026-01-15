@@ -1,0 +1,19 @@
+// File name: TransactionMarshaller.proto
+// Generated from : io.debezium.connector.oracle.logminer.processor.infinispan.marshalling.TransactionMarshaller
+
+syntax = "proto2";
+
+
+
+message InfinispanTransaction {
+   
+   required string transactionId = 1;
+   
+   required string scn = 2;
+   
+   required string changeTime = 3;
+   
+   optional int32 numberOfEvents = 4 [default = 0];
+   
+   optional string userName = 5;
+}

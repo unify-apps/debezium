@@ -1,0 +1,131 @@
+// File name: LogMinerEventMarshaller.proto
+// Generated from : io.debezium.connector.oracle.logminer.processor.infinispan.marshalling.LogMinerEventMarshaller
+
+syntax = "proto2";
+
+
+
+message LogMinerDmlEntryImpl {
+   
+   required int32 operation = 1;
+   
+   repeated string newValues = 2;
+   
+   repeated string oldValues = 3;
+   
+   required string name = 4;
+   
+   required string owner = 5;
+}
+
+
+message LobWriteEvent {
+   
+   required int32 eventType = 1;
+   
+   required string scn = 2;
+   
+   required string tableId = 3;
+   
+   required string rowId = 4;
+   
+   required string rsId = 5;
+   
+   required string changeTime = 6;
+   
+   optional string data = 7;
+   
+   required int32 offset = 8;
+   
+   required int32 length = 9;
+}
+
+
+message DmlEvent {
+   
+   required int32 eventType = 1;
+   
+   required string scn = 2;
+   
+   required string tableId = 3;
+   
+   required string rowId = 4;
+   
+   required string rsId = 5;
+   
+   required string changeTime = 6;
+   
+   required LogMinerDmlEntryImpl entry = 7;
+}
+
+
+message LogMinerEvent {
+   
+   required int32 eventType = 1;
+   
+   required string scn = 2;
+   
+   required string tableId = 3;
+   
+   required string rowId = 4;
+   
+   required string rsId = 5;
+   
+   required string changeTime = 6;
+}
+
+
+message SelectLobLocatorEvent {
+   
+   required int32 eventType = 1;
+   
+   required string scn = 2;
+   
+   required string tableId = 3;
+   
+   required string rowId = 4;
+   
+   required string rsId = 5;
+   
+   required string changeTime = 6;
+   
+   required LogMinerDmlEntryImpl entry = 7;
+   
+   required string columnName = 8;
+   
+   required bool binary = 9;
+}
+
+
+message TruncateEvent {
+   
+   required int32 eventType = 1;
+   
+   required string scn = 2;
+   
+   required string tableId = 3;
+   
+   required string rowId = 4;
+   
+   required string rsId = 5;
+   
+   required string changeTime = 6;
+   
+   required LogMinerDmlEntryImpl entry = 7;
+}
+
+
+message LobEraseEvent {
+   
+   required int32 eventType = 1;
+   
+   required string scn = 2;
+   
+   required string tableId = 3;
+   
+   required string rowId = 4;
+   
+   required string rsId = 5;
+   
+   required string changeTime = 6;
+}
