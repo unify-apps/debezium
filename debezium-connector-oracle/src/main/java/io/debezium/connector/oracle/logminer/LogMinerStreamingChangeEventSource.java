@@ -61,6 +61,8 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
     private static final int MAXIMUM_NAME_LENGTH = 30;
     private static final String ALL_COLUMN_LOGGING = "ALL COLUMN LOGGING";
     private static final int MINING_START_RETRIES = 5;
+    private static final int ADD_LOGFILE_MAX_RETRIES = 5;
+    private static final long ADD_LOGFILE_RETRY_DELAY_MS = 5000L;
 
     private final OracleConnection jdbcConnection;
     private final EventDispatcher<OraclePartition, TableId> dispatcher;
@@ -338,19 +340,64 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
         }
 
         if (!isContinuousMining) {
-            // Collect logs and add them to the session
-            currentLogFiles = logCollector.getLogs(startScn);
-            for (LogFile logFile : currentLogFiles) {
-                LOGGER.trace("Adding log file {} to the mining session.", logFile.getFileName());
-                String addLogFileStatement = SqlUtils.addLogFileStatement("DBMS_LOGMNR.ADDFILE", logFile.getFileName());
-                try (CallableStatement statement = connection.connection(false).prepareCall(addLogFileStatement)) {
-                    statement.execute();
-                }
-            }
+            addLogFilesWithRetry(connection, startScn);
             currentRedoLogSequences = getCurrentLogFileSequences(currentLogFiles);
         }
 
         updateRedoLogMetrics();
+    }
+
+    private void addLogFilesWithRetry(OracleConnection connection, Scn startScn) throws SQLException {
+        for (int attempt = 1; attempt <= ADD_LOGFILE_MAX_RETRIES; attempt++) {
+            try {
+                currentLogFiles = logCollector.getLogs(startScn);
+                for (LogFile logFile : currentLogFiles) {
+                    LOGGER.trace("Adding log file {} to the mining session.", logFile.getFileName());
+                    String addLogFileStatement = SqlUtils.addLogFileStatement("DBMS_LOGMNR.ADDFILE", logFile.getFileName());
+                    try (CallableStatement statement = connection.connection(false).prepareCall(addLogFileStatement)) {
+                        statement.execute();
+                    }
+                }
+                return; // all files added successfully
+            }
+            catch (SQLException e) {
+                if (isTransientLogFileError(e) && attempt < ADD_LOGFILE_MAX_RETRIES) {
+                    LOGGER.warn("Transient error adding log files to mining session (attempt {}/{}): {}. " +
+                            "Retrying in {}ms after clearing session and re-fetching logs.",
+                            attempt, ADD_LOGFILE_MAX_RETRIES, e.getMessage(), ADD_LOGFILE_RETRY_DELAY_MS);
+                    try {
+                        Thread.sleep(ADD_LOGFILE_RETRY_DELAY_MS);
+                    }
+                    catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new SQLException("Interrupted while retrying log file addition", ie);
+                    }
+                    // Clear the session before retrying so we start fresh
+                    try {
+                        connection.removeAllLogFilesFromLogMinerSession();
+                    }
+                    catch (SQLException cleanupEx) {
+                        LOGGER.warn("Failed to clear LogMiner session before retry: {}", cleanupEx.getMessage());
+                    }
+                }
+                else {
+                    LOGGER.error("Failed to add log files to mining session after {} attempt(s).", attempt, e);
+                    throw e;
+                }
+            }
+        }
+    }
+
+    private static boolean isTransientLogFileError(SQLException e) {
+        int errorCode = e.getErrorCode();
+        // ORA-01291: missing logfile
+        // ORA-00308: cannot open archived log
+        // ORA-00310: archived log contains sequence
+        // ORA-01289: cannot add duplicate logfile
+        return errorCode == 1291
+                || errorCode == 308
+                || errorCode == 310
+                || errorCode == 1289;
     }
 
     /**
