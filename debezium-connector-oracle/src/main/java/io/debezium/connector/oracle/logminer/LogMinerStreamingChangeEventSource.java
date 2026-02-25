@@ -206,6 +206,16 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
                         if (context.isRunning()) {
                             if (!startMiningSession(jdbcConnection, startScn, endScn, retryAttempts)) {
                                 retryAttempts++;
+                                if (retryAttempts < MINING_START_RETRIES) {
+                                    LOGGER.warn("ORA-01291 on attempt {}/{}. Refreshing log files before next retry.",
+                                            retryAttempts - 1, MINING_START_RETRIES);
+                                    try {
+                                        endMiningSession(jdbcConnection, offsetContext);
+                                    } catch (SQLException e) {
+                                        LOGGER.warn("Failed to end mining session before retry: {}", e.getMessage());
+                                    }
+                                    initializeRedoLogsForMining(jdbcConnection, true, startScn);
+                                }
                             }
                             else {
                                 retryAttempts = 1;
