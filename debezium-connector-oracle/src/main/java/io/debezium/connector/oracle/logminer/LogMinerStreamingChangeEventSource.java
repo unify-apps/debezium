@@ -211,7 +211,8 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
                                             retryAttempts - 1, MINING_START_RETRIES);
                                     try {
                                         endMiningSession(jdbcConnection, offsetContext);
-                                    } catch (SQLException e) {
+                                    }
+                                    catch (SQLException e) {
                                         LOGGER.warn("Failed to end mining session before retry: {}", e.getMessage());
                                     }
                                     initializeRedoLogsForMining(jdbcConnection, true, startScn);

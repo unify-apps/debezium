@@ -14,6 +14,8 @@ import java.time.ZoneOffset;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -182,6 +184,11 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
             statement.setString(2, endScn.toString());
 
             Instant queryStart = Instant.now();
+            Optional<Integer> queryTimeoutMsOptional = connectorConfig.getLogMiningQueryTimeoutMs();
+            if (queryTimeoutMsOptional.isPresent() && queryTimeoutMsOptional.get() != 0) {
+                String timeoutString = String.valueOf(TimeUnit.MILLISECONDS.toSeconds(queryTimeoutMsOptional.get()));
+                statement.setQueryTimeout(Integer.parseInt(timeoutString));
+            }
             try (ResultSet resultSet = statement.executeQuery()) {
                 metrics.setLastDurationOfBatchCapturing(Duration.between(queryStart, Instant.now()));
 

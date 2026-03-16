@@ -476,6 +476,15 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
             .withDescription(
                     "The maximum number of milliseconds that a LogMiner session lives for before being restarted. Defaults to 0 (indefinite until a log switch occurs)");
 
+    public static final Field LOG_MINING_QUERY_TIMEOUT_MS = Field.create("log.mining.query.timeout.ms")
+            .withDisplayName("Maximum number of milliseconds of a single LogMiner query")
+            .withType(Type.LONG)
+            .withWidth(Width.SHORT)
+            .withImportance(Importance.LOW)
+            .withDefault(TimeUnit.MINUTES.toMillis(0))
+            .withValidation(Field::isNonNegativeInteger)
+            .withDescription("The maximum number of milliseconds that a LogMiner query runs for before getting timed out. Defaults to 0 (indefinite/no timeout)");
+
     public static final Field LOG_MINING_TRANSACTION_SNAPSHOT_BOUNDARY_MODE = Field.createInternal("log.mining.transaction.snapshot.boundary.mode")
             .withEnum(TransactionSnapshotBoundaryMode.class, TransactionSnapshotBoundaryMode.SKIP)
             .withWidth(Width.SHORT)
@@ -544,7 +553,8 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
                     LOG_MINING_LOG_BACKOFF_INITIAL_DELAY_MS,
                     LOG_MINING_LOG_BACKOFF_MAX_DELAY_MS,
                     LOG_MINING_SESSION_MAX_MS,
-                    LOG_MINING_TRANSACTION_SNAPSHOT_BOUNDARY_MODE)
+                    LOG_MINING_TRANSACTION_SNAPSHOT_BOUNDARY_MODE,
+                    LOG_MINING_QUERY_TIMEOUT_MS)
             .create();
 
     /**
@@ -602,6 +612,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
     private final Duration logMiningMaxDelay;
     private final Duration logMiningMaximumSession;
     private final TransactionSnapshotBoundaryMode logMiningTransactionSnapshotBoundaryMode;
+    private final Integer logMiningQueryTimeoutMs;
 
     public OracleConnectorConfig(Configuration config) {
         super(OracleConnector.class, config, config.getString(SERVER_NAME), new SystemTablesPredicate(config),
@@ -650,6 +661,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
         this.logMiningMaxDelay = Duration.ofMillis(config.getLong(LOG_MINING_LOG_BACKOFF_MAX_DELAY_MS));
         this.logMiningMaximumSession = Duration.ofMillis(config.getLong(LOG_MINING_SESSION_MAX_MS));
         this.logMiningTransactionSnapshotBoundaryMode = TransactionSnapshotBoundaryMode.parse(config.getString(LOG_MINING_TRANSACTION_SNAPSHOT_BOUNDARY_MODE));
+        this.logMiningQueryTimeoutMs = config.getInteger(LOG_MINING_QUERY_TIMEOUT_MS);
     }
 
     private static String toUpperCase(String property) {
@@ -1504,6 +1516,10 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
      */
     public TransactionSnapshotBoundaryMode getLogMiningTransactionSnapshotBoundaryMode() {
         return logMiningTransactionSnapshotBoundaryMode;
+    }
+
+    public Optional<Integer> getLogMiningQueryTimeoutMs() {
+        return logMiningQueryTimeoutMs == 0 ? Optional.empty() : Optional.of(logMiningQueryTimeoutMs);
     }
 
     @Override
