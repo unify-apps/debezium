@@ -189,7 +189,7 @@ public final class EmbeddedEngine implements DebeziumEngine<SourceRecord> {
      */
     public static final Field MAX_RETRIES = Field.create("max.retries")
             .withDescription("Maximum number of consecutive retriable polling failures before the engine stops. "
-                    + "Use a negative value to retry indefinitely. Defaults to 10.")
+                    + "Use a negative value to retry indefinitely. Defaults to -1.")
             .withType(Type.INT)
             .withDefault(-1);
 
