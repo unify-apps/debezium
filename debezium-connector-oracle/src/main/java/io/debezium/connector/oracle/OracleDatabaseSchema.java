@@ -8,7 +8,10 @@ package io.debezium.connector.oracle;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
@@ -43,6 +46,27 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
     private final ConcurrentMap<TableId, List<Column>> lobColumnsByTableId = new ConcurrentHashMap<>();
     private final OracleValueConverters valueConverters;
 
+    /**
+     * Registry of Oracle {@code OBJECT_ID} values to relational table identifiers, used by the LogMiner
+     * hybrid mining strategy to resolve events whose table name could not be reconstructed by LogMiner
+     * (reported as {@code OBJ# <n>} or {@code UNKNOWN} for dropped and purged objects).
+     * <p>
+     * Upstream stores these identifiers as relational model {@link Table} attributes (DBZ-3401) and
+     * resolves them through a cache in this class (DBZ-8071, DBZ-8925). Debezium core 1.9.8 has no
+     * table attribute support, so this registry is the system of record instead: it is warmed from
+     * {@code ALL_OBJECTS} for all captured tables when streaming starts, updated as DDL events are
+     * observed, and consulted on demand. Entries are intentionally never removed on DROP so trailing
+     * DML events that precede the drop in the redo stream still resolve.
+     */
+    private final ConcurrentMap<Long, TableObjectId> objectIdToTableId = new ConcurrentHashMap<>();
+
+    /**
+     * Bounded negative-lookup cache of object ids known to be unresolvable, preventing repeated
+     * database lookups for the same unknown object id (upstream DBZ-8399 semantics). Bounded by
+     * {@code internal.log.mining.object.id.cache.size} (upstream DBZ-8071).
+     */
+    private final Map<Long, Boolean> unresolvableObjectIds;
+
     private boolean storageInitializationExecuted = false;
 
     public OracleDatabaseSchema(OracleConnectorConfig connectorConfig, OracleValueConverters valueConverters,
@@ -68,6 +92,74 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
                 connectorConfig.isSchemaCommentsHistoryEnabled(),
                 valueConverters,
                 connectorConfig.getTableFilters().dataCollectionFilter());
+
+        final int objectIdCacheSize = connectorConfig.getLogMiningObjectIdCacheSize();
+        this.unresolvableObjectIds = Collections.synchronizedMap(new LinkedHashMap<Long, Boolean>(16, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<Long, Boolean> eldest) {
+                return size() > objectIdCacheSize;
+            }
+        });
+    }
+
+    /**
+     * Registers the Oracle object identifiers for a captured table.
+     *
+     * @param tableId the relational table identifier, ignored if {@code null}
+     * @param objectId the table's {@code OBJECT_ID}, ignored if {@code null}
+     * @param dataObjectId the table's {@code DATA_OBJECT_ID}; may be {@code null} when unknown, in
+     *            which case the entry matches lookups regardless of the requested data object id
+     */
+    public void registerTableObjectId(TableId tableId, Long objectId, Long dataObjectId) {
+        if (tableId != null && objectId != null) {
+            objectIdToTableId.put(objectId, new TableObjectId(tableId, dataObjectId));
+            unresolvableObjectIds.remove(objectId);
+        }
+    }
+
+    /**
+     * Get the {@link TableId} by the table's Oracle object id.
+     *
+     * @param objectId the object id to look up, must not be {@code null}
+     * @param dataObjectId the data object id, may be {@code null} to match on object id alone
+     * @return the resolved table identifier, or {@code null} if no registered entry matches
+     */
+    public TableId getTableIdByObjectId(Long objectId, Long dataObjectId) {
+        Objects.requireNonNull(objectId, "The database table object id must not be null");
+        final TableObjectId entry = objectIdToTableId.get(objectId);
+        if (entry == null) {
+            return null;
+        }
+        if (dataObjectId != null && entry.dataObjectId != null && !dataObjectId.equals(entry.dataObjectId)) {
+            return null;
+        }
+        return entry.tableId;
+    }
+
+    /**
+     * Returns whether a prior lookup already failed to resolve the given object id.
+     */
+    public boolean isObjectIdUnresolvable(Long objectId) {
+        return objectId != null && unresolvableObjectIds.containsKey(objectId);
+    }
+
+    /**
+     * Records that the given object id could not be resolved, so subsequent lookups fail fast.
+     */
+    public void registerUnresolvableObjectId(Long objectId) {
+        if (objectId != null) {
+            unresolvableObjectIds.put(objectId, Boolean.TRUE);
+        }
+    }
+
+    private static final class TableObjectId {
+        private final TableId tableId;
+        private final Long dataObjectId;
+
+        private TableObjectId(TableId tableId, Long dataObjectId) {
+            this.tableId = tableId;
+            this.dataObjectId = dataObjectId;
+        }
     }
 
     public Tables getTables() {

@@ -158,6 +158,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
             .withWidth(Width.MEDIUM)
             .withImportance(Importance.HIGH)
             .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED, 8))
+            .withValidation(OracleConnectorConfig::validateLogMiningStrategy)
             .withDescription("There are strategies: Online catalog with faster mining but no captured DDL. Another - with data dictionary loaded into REDO LOG files");
 
     // this option could be true up to Oracle 18c version. Starting from Oracle 19c this option cannot be true todo should we do it?
@@ -495,6 +496,15 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
                     "Recently committed transactions near the flashback query SCN won't be included in the snapshot nor streaming." + System.lineSeparator() +
                     "skip - Skips gathering any in-progress transactions.");
 
+    public static final Field LOG_MINING_OBJECT_ID_CACHE_SIZE = Field.createInternal("log.mining.object.id.cache.size")
+            .withDisplayName("Object ID cache size")
+            .withType(Type.INT)
+            .withWidth(Width.SHORT)
+            .withImportance(Importance.LOW)
+            .withDefault(256)
+            .withValidation(Field::isPositiveInteger)
+            .withDescription("The maximum number of entries in the object-id-to-table-id negative lookup cache used by the hybrid mining strategy.");
+
     private static final ConfigDefinition CONFIG_DEFINITION = HistorizedRelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
             .name("Oracle")
             .excluding(
@@ -554,7 +564,8 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
                     LOG_MINING_LOG_BACKOFF_MAX_DELAY_MS,
                     LOG_MINING_SESSION_MAX_MS,
                     LOG_MINING_TRANSACTION_SNAPSHOT_BOUNDARY_MODE,
-                    LOG_MINING_QUERY_TIMEOUT_MS)
+                    LOG_MINING_QUERY_TIMEOUT_MS,
+                    LOG_MINING_OBJECT_ID_CACHE_SIZE)
             .create();
 
     /**
@@ -613,6 +624,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
     private final Duration logMiningMaximumSession;
     private final TransactionSnapshotBoundaryMode logMiningTransactionSnapshotBoundaryMode;
     private final Integer logMiningQueryTimeoutMs;
+    private final int logMiningObjectIdCacheSize;
 
     public OracleConnectorConfig(Configuration config) {
         super(OracleConnector.class, config, config.getString(SERVER_NAME), new SystemTablesPredicate(config),
@@ -662,6 +674,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
         this.logMiningMaximumSession = Duration.ofMillis(config.getLong(LOG_MINING_SESSION_MAX_MS));
         this.logMiningTransactionSnapshotBoundaryMode = TransactionSnapshotBoundaryMode.parse(config.getString(LOG_MINING_TRANSACTION_SNAPSHOT_BOUNDARY_MODE));
         this.logMiningQueryTimeoutMs = config.getInteger(LOG_MINING_QUERY_TIMEOUT_MS);
+        this.logMiningObjectIdCacheSize = config.getInteger(LOG_MINING_OBJECT_ID_CACHE_SIZE);
     }
 
     private static String toUpperCase(String property) {
@@ -1109,7 +1122,14 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
          * This option does not use CONTINUOUS_MINE option
          * This is default value
          */
-        CATALOG_IN_REDO("redo_log_catalog");
+        CATALOG_IN_REDO("redo_log_catalog"),
+
+        /**
+         * This strategy combines the performance of {@code online_catalog} with the schema capture capabilities of
+         * the {@code redo_log_catalog} strategy. If LogMiner fails to reconstruct a DML event, this strategy will
+         * default to using Debezium's schema metadata to reconstruct the DML in-flight when LogMiner cannot.
+         */
+        HYBRID("hybrid");
 
         private final String value;
 
@@ -1522,6 +1542,14 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
         return logMiningQueryTimeoutMs == 0 ? Optional.empty() : Optional.of(logMiningQueryTimeoutMs);
     }
 
+    /**
+     * @return the maximum number of entries in the object-id-to-table-id negative lookup cache
+     *         used by the hybrid mining strategy.
+     */
+    public int getLogMiningObjectIdCacheSize() {
+        return logMiningObjectIdCacheSize;
+    }
+
     @Override
     public String getConnectorName() {
         return Module.name();
@@ -1619,5 +1647,25 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
             errors = Field.isRequired(config, field, problems);
         }
         return errors;
+    }
+
+    public static int validateLogMiningStrategy(Configuration config, Field field, ValidationOutput problems) {
+        if (ConnectorAdapter.LOG_MINER.equals(ConnectorAdapter.parse(config.getString(CONNECTOR_ADAPTER)))) {
+            if (config.getBoolean(LOB_ENABLED)) {
+                // When LOB is enabled, the combination is not valid with the hybrid strategy.
+                // This is because we currently are not capable of decoding all LOB-based operations in
+                // the LogMiner event stream to support CLOB, NCLOB, BLOB, XML, and JSON just yet.
+                // This is an ongoing, work-in-progress strategy.
+                final String strategy = config.getString(LOG_MINING_STRATEGY);
+                if (LogMiningStrategy.HYBRID.equals(LogMiningStrategy.parse(strategy))) {
+                    problems.accept(LOG_MINING_STRATEGY, strategy,
+                            String.format("The hybrid mining strategy is not compatible when enabling '%s'. " +
+                                    "Please use a different '%s' or do not enable '%s'.",
+                                    LOB_ENABLED.name(), LOG_MINING_STRATEGY.name(), LOB_ENABLED.name()));
+                    return 1;
+                }
+            }
+        }
+        return 0;
     }
 }
