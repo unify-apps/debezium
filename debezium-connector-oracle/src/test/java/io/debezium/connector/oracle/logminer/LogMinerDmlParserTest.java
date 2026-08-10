@@ -16,6 +16,7 @@ import io.debezium.connector.oracle.OracleValueConverters;
 import io.debezium.connector.oracle.junit.SkipTestDependingOnAdapterNameRule;
 import io.debezium.connector.oracle.junit.SkipWhenAdapterNameIsNot;
 import io.debezium.connector.oracle.logminer.events.EventType;
+import io.debezium.connector.oracle.logminer.parser.LogMinerColumnResolverDmlParser;
 import io.debezium.connector.oracle.logminer.parser.LogMinerDmlEntry;
 import io.debezium.connector.oracle.logminer.parser.LogMinerDmlParser;
 import io.debezium.doc.FixFor;
@@ -35,11 +36,13 @@ public class LogMinerDmlParserTest {
     public TestRule skipRule = new SkipTestDependingOnAdapterNameRule();
 
     private LogMinerDmlParser fastDmlParser;
+    private LogMinerColumnResolverDmlParser columnResolverDmlParser;
 
     @Before
     public void beforeEach() throws Exception {
         // Create LogMinerDmlParser
         fastDmlParser = new LogMinerDmlParser();
+        columnResolverDmlParser = new LogMinerColumnResolverDmlParser();
     }
 
     // Oracle's generated SQL avoids common spacing patterns such as spaces between column values or values
@@ -531,5 +534,148 @@ public class LogMinerDmlParserTest {
         assertThat(entry.getOldValues()[0]).isEqualTo("I||am");
         assertThat(entry.getOldValues()[1]).isEqualTo("test||case");
         assertThat(entry.getNewValues()).isEmpty();
+    }
+
+    @Test
+    @FixFor("DBZ-3401")
+    public void shouldParseInsertOnSchemaVersionMismatch() throws Exception {
+        final Table table = Table.editor()
+                .tableId(TableId.parse("DEBEZIUM.DBZ3401"))
+                .addColumn(Column.editor().name("ID").create())
+                .addColumn(Column.editor().name("DATA").create())
+                .create();
+
+        // Test columns in forward order
+        String sql = "insert into \"DEBEZIUM\".\"DBZ3401\" (\"COL 1\",\"COL 2\") values (HEXTORAW('a'),HEXTORAW('b'));";
+        LogMinerDmlEntry entry = columnResolverDmlParser.parse(sql, table);
+        assertThat(entry.getEventType()).isEqualTo(EventType.INSERT);
+        assertThat(entry.getOldValues()).isEmpty();
+        assertThat(entry.getNewValues()).hasSize(2);
+        assertThat(entry.getNewValues()[0]).isEqualTo("HEXTORAW('a')");
+        assertThat(entry.getNewValues()[1]).isEqualTo("HEXTORAW('b')");
+
+        // Test columns in reverse order
+        sql = "insert into \"DEBEZIUM\".\"DBZ3401\" (\"COL 2\",\"COL 1\") values (HEXTORAW('b'),HEXTORAW('a'));";
+        entry = columnResolverDmlParser.parse(sql, table);
+        assertThat(entry.getEventType()).isEqualTo(EventType.INSERT);
+        assertThat(entry.getOldValues()).isEmpty();
+        assertThat(entry.getNewValues()).hasSize(2);
+        assertThat(entry.getNewValues()[0]).isEqualTo("HEXTORAW('a')");
+        assertThat(entry.getNewValues()[1]).isEqualTo("HEXTORAW('b')");
+    }
+
+    @Test
+    @FixFor("DBZ-3401")
+    public void shouldParseUpdateOnSchemaVersionMismatch() throws Exception {
+        final Table table = Table.editor()
+                .tableId(TableId.parse("DEBEZIUM.DBZ3401"))
+                .addColumn(Column.editor().name("ID").create())
+                .addColumn(Column.editor().name("DATA").create())
+                .create();
+
+        // Test columns in forward order
+        String sql = "update \"DEBEZIUM\".\"DBZ3401\" set \"COL 1\" = HEXTORAW('c'), \"COL 2\" = HEXTORAW('d') where \"COL 1\" = HEXTORAW('a') and \"COL 2\" = HEXTORAW('b');";
+        LogMinerDmlEntry entry = columnResolverDmlParser.parse(sql, table);
+        assertThat(entry.getEventType()).isEqualTo(EventType.UPDATE);
+        assertThat(entry.getOldValues()).hasSize(2);
+        assertThat(entry.getOldValues()[0]).isEqualTo("HEXTORAW('a')");
+        assertThat(entry.getOldValues()[1]).isEqualTo("HEXTORAW('b')");
+        assertThat(entry.getNewValues()).hasSize(2);
+        assertThat(entry.getNewValues()[0]).isEqualTo("HEXTORAW('c')");
+        assertThat(entry.getNewValues()[1]).isEqualTo("HEXTORAW('d')");
+
+        // Test columns in reverse order
+        sql = "update \"DEBEZIUM\".\"DBZ3401\" set \"COL 2\" = HEXTORAW('d'), \"COL 1\" = HEXTORAW('c') where \"COL 2\" = HEXTORAW('b') and \"COL 1\" = HEXTORAW('a');";
+        entry = columnResolverDmlParser.parse(sql, table);
+        assertThat(entry.getEventType()).isEqualTo(EventType.UPDATE);
+        assertThat(entry.getOldValues()).hasSize(2);
+        assertThat(entry.getOldValues()[0]).isEqualTo("HEXTORAW('a')");
+        assertThat(entry.getOldValues()[1]).isEqualTo("HEXTORAW('b')");
+        assertThat(entry.getNewValues()).hasSize(2);
+        assertThat(entry.getNewValues()[0]).isEqualTo("HEXTORAW('c')");
+        assertThat(entry.getNewValues()[1]).isEqualTo("HEXTORAW('d')");
+    }
+
+    @Test
+    @FixFor("DBZ-3401")
+    public void shouldParseDeleteOnSchemaVersionMismatch() throws Exception {
+        final Table table = Table.editor()
+                .tableId(TableId.parse("DEBEZIUM.DBZ3401"))
+                .addColumn(Column.editor().name("ID").create())
+                .addColumn(Column.editor().name("DATA").create())
+                .create();
+
+        // Test where columns in forward order
+        String sql = "delete from \"DEBEZIUM\".\"DBZ3401\" where \"COL 1\" = HEXTORAW('a') and \"COL 2\" = HEXTORAW('b');";
+        LogMinerDmlEntry entry = columnResolverDmlParser.parse(sql, table);
+        assertThat(entry.getEventType()).isEqualTo(EventType.DELETE);
+        assertThat(entry.getOldValues()).hasSize(2);
+        assertThat(entry.getOldValues()[0]).isEqualTo("HEXTORAW('a')");
+        assertThat(entry.getOldValues()[1]).isEqualTo("HEXTORAW('b')");
+        assertThat(entry.getNewValues()).isEmpty();
+
+        // Test where columns in reverse order
+        sql = "delete from \"DEBEZIUM\".\"DBZ3401\" where \"COL 2\" = HEXTORAW('b') and \"COL 1\" = HEXTORAW('a');";
+        entry = columnResolverDmlParser.parse(sql, table);
+        assertThat(entry.getEventType()).isEqualTo(EventType.DELETE);
+        assertThat(entry.getOldValues()).hasSize(2);
+        assertThat(entry.getOldValues()[0]).isEqualTo("HEXTORAW('a')");
+        assertThat(entry.getOldValues()[1]).isEqualTo("HEXTORAW('b')");
+        assertThat(entry.getNewValues()).isEmpty();
+    }
+
+    @Test
+    @FixFor("DBZ-8597")
+    public void shouldResolveColumnPositionsSkippingGeneratedColumns() throws Exception {
+        // LogMiner numbers "COL x" placeholders by physical position excluding generated (virtual)
+        // columns, while the relational model includes them; the resolver must bridge the two.
+        final Table table = Table.editor()
+                .tableId(TableId.parse("DEBEZIUM.DBZ8597"))
+                .addColumn(Column.editor().name("ID").create())
+                .addColumn(Column.editor().name("GEN").generated(true).create())
+                .addColumn(Column.editor().name("DATA").create())
+                .create();
+
+        final String sql = "insert into \"DEBEZIUM\".\"DBZ8597\" (\"COL 1\",\"COL 2\") values (HEXTORAW('a'),HEXTORAW('b'));";
+        final LogMinerDmlEntry entry = columnResolverDmlParser.parse(sql, table);
+        assertThat(entry.getEventType()).isEqualTo(EventType.INSERT);
+        assertThat(entry.getNewValues()).hasSize(3);
+        assertThat(entry.getNewValues()[0]).isEqualTo("HEXTORAW('a')");
+        assertThat(entry.getNewValues()[1]).isNull();
+        assertThat(entry.getNewValues()[2]).isEqualTo("HEXTORAW('b')");
+    }
+
+    @Test
+    @FixFor("DBZ-8597")
+    public void shouldRecomputeColumnPositionsAfterTableRemovedFromCache() throws Exception {
+        // Prime the position cache with the pre-DDL shape of the table.
+        final TableId tableId = TableId.parse("DEBEZIUM.DBZ8597B");
+        final Table tableBefore = Table.editor()
+                .tableId(tableId)
+                .addColumn(Column.editor().name("ID").create())
+                .addColumn(Column.editor().name("DATA").create())
+                .create();
+
+        String sql = "insert into \"DEBEZIUM\".\"DBZ8597B\" (\"COL 1\",\"COL 2\") values (HEXTORAW('a'),HEXTORAW('b'));";
+        LogMinerDmlEntry entry = columnResolverDmlParser.parse(sql, tableBefore);
+        assertThat(entry.getNewValues()).hasSize(2);
+        assertThat(entry.getNewValues()[1]).isEqualTo("HEXTORAW('b')");
+
+        // The table gains a generated column ahead of DATA; the stale cache entry still maps
+        // "COL 2" to the old position, which is why schema changes must evict the table.
+        final Table tableAfter = Table.editor()
+                .tableId(tableId)
+                .addColumn(Column.editor().name("ID").create())
+                .addColumn(Column.editor().name("GEN").generated(true).create())
+                .addColumn(Column.editor().name("DATA").create())
+                .create();
+
+        columnResolverDmlParser.removeTableFromCache(tableId);
+
+        entry = columnResolverDmlParser.parse(sql, tableAfter);
+        assertThat(entry.getNewValues()).hasSize(3);
+        assertThat(entry.getNewValues()[0]).isEqualTo("HEXTORAW('a')");
+        assertThat(entry.getNewValues()[1]).isNull();
+        assertThat(entry.getNewValues()[2]).isEqualTo("HEXTORAW('b')");
     }
 }
