@@ -38,6 +38,7 @@ import io.debezium.relational.Tables.ColumnNameFilter;
 import io.debezium.util.Strings;
 
 import oracle.jdbc.OracleTypes;
+import oracle.sql.CharacterSet;
 
 public class OracleConnection extends JdbcConnection {
 
@@ -74,6 +75,19 @@ public class OracleConnection extends JdbcConnection {
     private final OracleDatabaseVersion databaseVersion;
 
     private static final String QUOTED_CHARACTER = "\"";
+
+    /**
+     * Lazily-resolved database character set (NLS_CHARACTERSET), used to decode {@code HEXTORAW}
+     * values for {@code CHAR}/{@code VARCHAR2} columns under the hybrid mining strategy.
+     */
+    private CharacterSet databaseCharacterSet;
+
+    /**
+     * Lazily-resolved national character set (NLS_NCHAR_CHARACTERSET), used to decode
+     * {@code HEXTORAW} values for {@code NCHAR}/{@code NVARCHAR2} columns under the hybrid
+     * mining strategy.
+     */
+    private CharacterSet nationalCharacterSet;
 
     public OracleConnection(JdbcConfiguration config, Supplier<ClassLoader> classLoaderSupplier) {
         this(config, classLoaderSupplier, true);
@@ -636,6 +650,130 @@ public class OracleConnection extends JdbcConnection {
             LOGGER.warn("Failed to find archive log for redo thread {} and sequence {}", threadId, sequenceId, e);
             return null;
         }
+    }
+
+    /**
+     * Get the table's Oracle {@code OBJECT_ID} from {@code ALL_OBJECTS}.
+     *
+     * @param tableId the table identifier, should not be {@code null}
+     * @return the table's object id, or {@code null} if the table was not found
+     * @throws SQLException if a database exception occurred
+     */
+    public Long getTableObjectId(TableId tableId) throws SQLException {
+        return prepareQueryAndMap(
+                "SELECT OBJECT_ID FROM ALL_OBJECTS WHERE OBJECT_TYPE='TABLE' AND OWNER=? AND OBJECT_NAME=?",
+                ps -> {
+                    ps.setString(1, tableId.schema());
+                    ps.setString(2, tableId.table());
+                }, rs -> rs.next() ? rs.getLong(1) : null);
+    }
+
+    /**
+     * Get the table's Oracle {@code DATA_OBJECT_ID} from {@code ALL_OBJECTS}.
+     *
+     * @param tableId the table identifier, should not be {@code null}
+     * @return the table's data object id, or {@code null} if the table was not found or has no data segment
+     * @throws SQLException if a database exception occurred
+     */
+    public Long getTableDataObjectId(TableId tableId) throws SQLException {
+        return prepareQueryAndMap(
+                "SELECT DATA_OBJECT_ID FROM ALL_OBJECTS WHERE OBJECT_TYPE='TABLE' AND OWNER=? AND OBJECT_NAME=?",
+                ps -> {
+                    ps.setString(1, tableId.schema());
+                    ps.setString(2, tableId.table());
+                }, rs -> {
+                    if (rs.next()) {
+                        final long dataObjectId = rs.getLong(1);
+                        return rs.wasNull() ? null : dataObjectId;
+                    }
+                    return null;
+                });
+    }
+
+    /**
+     * Resolves the owning table of the given Oracle object id from {@code ALL_OBJECTS}.
+     *
+     * Note that a dropped and purged object no longer exists in {@code ALL_OBJECTS} and cannot be
+     * resolved by this method; such lookups return {@code null}.
+     *
+     * @param objectId the object id to resolve, should not be {@code null}
+     * @param catalogName the catalog name to associate with the resolved identifier
+     * @return the resolved table identifier, or {@code null} if the object id was not found
+     * @throws SQLException if a database exception occurred
+     */
+    public TableId resolveTableIdByObjectId(Long objectId, String catalogName) throws SQLException {
+        return prepareQueryAndMap(
+                "SELECT OWNER, OBJECT_NAME FROM ALL_OBJECTS WHERE OBJECT_TYPE='TABLE' AND OBJECT_ID=?",
+                ps -> ps.setLong(1, objectId),
+                rs -> rs.next() ? new TableId(catalogName, rs.getString(1), rs.getString(2)) : null);
+    }
+
+    /**
+     * Get the database character set used for {@code VARCHAR2}, {@code CHAR}, and {@code CLOB} data types.
+     *
+     * The database character set is set at database creation and does not change, so the result is
+     * lazily fetched once per connection instance and cached. Backport of upstream dbz#1798
+     * ({@code 77fb3d1ca}); fetched lazily so that connectors not using the hybrid mining strategy
+     * never issue the query.
+     *
+     * @return the database character set
+     */
+    public synchronized CharacterSet getDatabaseCharacterSet() {
+        if (databaseCharacterSet == null) {
+            final String query = "SELECT NLS_CHARSET_ID(VALUE) FROM NLS_DATABASE_PARAMETERS WHERE PARAMETER = 'NLS_CHARACTERSET'";
+            try {
+                final Integer charsetId = queryAndMap(query, rs -> {
+                    if (rs.next()) {
+                        return rs.getInt(1);
+                    }
+                    return null;
+                });
+                if (charsetId == null || charsetId == 0) {
+                    throw new SQLException("Failed to resolve Oracle's NLS_CHARACTERSET property");
+                }
+                databaseCharacterSet = CharacterSet.make(charsetId);
+            }
+            catch (SQLException e) {
+                throw new DebeziumException("Failed to resolve Oracle's NLS_CHARACTERSET property", e);
+            }
+        }
+        return databaseCharacterSet;
+    }
+
+    /**
+     * Get the nationalized character set used for {@code NVARCHAR} and {@code NCHAR} data types.
+     *
+     * The nationalized character set must be set at database creation, so the result is lazily
+     * fetched once per connection instance and cached. Backport of upstream DBZ-3401
+     * ({@code 648db8886}). It can only be {@code AL16UTF16} or {@code UTF8}.
+     *
+     * @return the national character set
+     */
+    public synchronized CharacterSet getNationalCharacterSet() {
+        if (nationalCharacterSet == null) {
+            final String query = "SELECT VALUE FROM NLS_DATABASE_PARAMETERS WHERE PARAMETER = 'NLS_NCHAR_CHARACTERSET'";
+            try {
+                final String nlsCharacterSet = queryAndMap(query, rs -> {
+                    if (rs.next()) {
+                        return rs.getString(1);
+                    }
+                    return null;
+                });
+                if ("AL16UTF16".equals(nlsCharacterSet)) {
+                    nationalCharacterSet = CharacterSet.make(CharacterSet.AL16UTF16_CHARSET);
+                }
+                else if ("UTF8".equals(nlsCharacterSet)) {
+                    nationalCharacterSet = CharacterSet.make(CharacterSet.UTF8_CHARSET);
+                }
+                else {
+                    throw new SQLException("An unexpected NLS_NCHAR_CHARACTERSET detected: " + nlsCharacterSet);
+                }
+            }
+            catch (SQLException e) {
+                throw new DebeziumException("Failed to resolve Oracle's NLS_NCHAR_CHARACTERSET property", e);
+            }
+        }
+        return nationalCharacterSet;
     }
 
     private static Scn readScnColumnAsScn(ResultSet rs, String columnName) throws SQLException {
