@@ -232,12 +232,25 @@ public class MemoryLogMinerEventProcessor extends AbstractLogMinerEventProcessor
                 getTransactionCache().put(transactionId, transaction);
             }
 
-            int eventId = transaction.getNextEventId();
+            // Peek at the next event id without consuming it so that an event skipped due to a DML
+            // parse failure (see getEventFromSupplier) neither consumes an event slot nor breaks the
+            // event list/counter alignment relied upon for re-mining de-duplication.
+            int eventId = transaction.getNumberOfEvents();
             if (transaction.getEvents().size() <= eventId) {
+                final LogMinerEvent event = getEventFromSupplier(row, eventSupplier);
+                if (event == null) {
+                    // The event could not be parsed and the failure handling mode is not FAIL.
+                    return;
+                }
                 // Add new event at eventId offset
                 LOGGER.trace("Transaction {}, adding event reference at index {}", transactionId, eventId);
-                transaction.getEvents().add(eventSupplier.get());
+                transaction.getNextEventId();
+                transaction.getEvents().add(event);
                 metrics.calculateLagMetrics(row.getChangeTime());
+            }
+            else {
+                // Event already exists at this offset from a prior mining iteration; only advance.
+                transaction.getNextEventId();
             }
 
             metrics.setActiveTransactions(getTransactionCache().size());

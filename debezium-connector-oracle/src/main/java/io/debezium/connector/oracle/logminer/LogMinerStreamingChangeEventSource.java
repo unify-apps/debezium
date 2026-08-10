@@ -148,6 +148,10 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
                 setNlsSessionParameters(jdbcConnection);
                 checkDatabaseAndTableState(jdbcConnection, connectorConfig.getPdbName(), schema);
 
+                if (OracleConnectorConfig.LogMiningStrategy.HYBRID.equals(connectorConfig.getLogMiningStrategy())) {
+                    registerCapturedTableObjectIds();
+                }
+
                 try (LogMinerEventProcessor processor = createProcessor(context, partition, offsetContext)) {
 
                     if (archiveLogOnlyMode && !waitForStartScnInArchiveLogs(context, startScn)) {
@@ -320,6 +324,37 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
                                                    OracleOffsetContext offsetContext) {
         final LogMiningBufferType bufferType = connectorConfig.getLogMiningBufferType();
         return bufferType.createProcessor(context, connectorConfig, jdbcConnection, dispatcher, partition, offsetContext, schema, streamingMetrics);
+    }
+
+    /**
+     * Warms the schema's object-id registry with the {@code OBJECT_ID}/{@code DATA_OBJECT_ID} of every
+     * captured table when streaming with the hybrid mining strategy. The registry cannot be recovered
+     * from the schema history (Debezium 1.9.8 has no table attribute support), so it is re-derived from
+     * {@code ALL_OBJECTS} on every streaming start and kept current by observed DDL events thereafter.
+     *
+     * @throws SQLException if a database exception occurred
+     */
+    private void registerCapturedTableObjectIds() throws SQLException {
+        try (OracleConnection connection = new OracleConnection(connectorConfig.getJdbcConfig(), () -> getClass().getClassLoader(), false)) {
+            if (connectorConfig.getPdbName() != null) {
+                connection.setSessionToPdb(connectorConfig.getPdbName());
+            }
+            int registered = 0;
+            for (TableId tableId : schema.tableIds()) {
+                final Long objectId = connection.getTableObjectId(tableId);
+                if (objectId != null) {
+                    schema.registerTableObjectId(tableId, objectId, connection.getTableDataObjectId(tableId));
+                    registered++;
+                }
+                else {
+                    // The table exists in the relational model but not in ALL_OBJECTS; it may have been
+                    // dropped since. Events for it can still be resolved lazily by object id if needed.
+                    LOGGER.warn("Could not resolve the object id for captured table {}; " +
+                            "hybrid strategy lookups for this table will rely on observed DDL events.", tableId);
+                }
+            }
+            LOGGER.info("Hybrid mining strategy: registered object ids for {} captured tables.", registered);
+        }
     }
 
     /**
