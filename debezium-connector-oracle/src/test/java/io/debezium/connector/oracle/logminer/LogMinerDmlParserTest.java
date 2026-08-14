@@ -7,6 +7,9 @@ package io.debezium.connector.oracle.logminer;
 
 import static org.fest.assertions.Assertions.assertThat;
 
+import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicInteger;
+
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
@@ -677,5 +680,128 @@ public class LogMinerDmlParserTest {
         assertThat(entry.getNewValues()[0]).isEqualTo("HEXTORAW('a')");
         assertThat(entry.getNewValues()[1]).isNull();
         assertThat(entry.getNewValues()[2]).isEqualTo("HEXTORAW('b')");
+    }
+
+    @Test
+    @FixFor("DBZ-3401")
+    public void shouldSkipHiddenStoredColumnsUsingStoredColumnLayout() throws Exception {
+        // A fast "ALTER TABLE ... ADD (FLAG ... DEFAULT ...)" appends a hidden SYS_NC...$ bitmap
+        // column to the physical layout ahead of the added column. LogMiner numbers COL x by the
+        // stored-segment position, so a reconstructed statement carries one more placeholder than
+        // the relational model has columns; a positional mapping either overflows or shifts every
+        // value after the hidden column by one.
+        final Table table = Table.editor()
+                .tableId(TableId.parse("DEBEZIUM.DBZHIDDEN"))
+                .addColumn(Column.editor().name("ID").create())
+                .addColumn(Column.editor().name("DATA").create())
+                .addColumn(Column.editor().name("FLAG").create())
+                .create();
+
+        columnResolverDmlParser.setStoredColumnLayoutProvider(tableId -> Arrays.asList(
+                new LogMinerColumnResolverDmlParser.StoredColumn("ID", 1, false),
+                new LogMinerColumnResolverDmlParser.StoredColumn("DATA", 2, false),
+                new LogMinerColumnResolverDmlParser.StoredColumn("SYS_NC00003$", 3, true),
+                new LogMinerColumnResolverDmlParser.StoredColumn("FLAG", 4, false)));
+
+        String sql = "insert into \"DEBEZIUM\".\"DBZHIDDEN\" (\"COL 1\",\"COL 2\",\"COL 3\",\"COL 4\") values " +
+                "(HEXTORAW('a'),HEXTORAW('b'),HEXTORAW('01'),HEXTORAW('d'));";
+        LogMinerDmlEntry entry = columnResolverDmlParser.parse(sql, table);
+        assertThat(entry.getEventType()).isEqualTo(EventType.INSERT);
+        assertThat(entry.getNewValues()).hasSize(3);
+        assertThat(entry.getNewValues()[0]).isEqualTo("HEXTORAW('a')");
+        assertThat(entry.getNewValues()[1]).isEqualTo("HEXTORAW('b')");
+        assertThat(entry.getNewValues()[2]).isEqualTo("HEXTORAW('d')");
+
+        sql = "update \"DEBEZIUM\".\"DBZHIDDEN\" set \"COL 4\" = HEXTORAW('e') where \"COL 1\" = HEXTORAW('a') " +
+                "and \"COL 3\" = HEXTORAW('01') and \"COL 4\" = HEXTORAW('d');";
+        entry = columnResolverDmlParser.parse(sql, table);
+        assertThat(entry.getEventType()).isEqualTo(EventType.UPDATE);
+        assertThat(entry.getOldValues()).hasSize(3);
+        assertThat(entry.getOldValues()[0]).isEqualTo("HEXTORAW('a')");
+        assertThat(entry.getOldValues()[2]).isEqualTo("HEXTORAW('d')");
+        assertThat(entry.getNewValues()).hasSize(3);
+        assertThat(entry.getNewValues()[2]).isEqualTo("HEXTORAW('e')");
+
+        sql = "delete from \"DEBEZIUM\".\"DBZHIDDEN\" where \"COL 1\" = HEXTORAW('a') and \"COL 3\" = HEXTORAW('01');";
+        entry = columnResolverDmlParser.parse(sql, table);
+        assertThat(entry.getEventType()).isEqualTo(EventType.DELETE);
+        assertThat(entry.getOldValues()).hasSize(3);
+        assertThat(entry.getOldValues()[0]).isEqualTo("HEXTORAW('a')");
+        assertThat(entry.getOldValues()[1]).isNull();
+        assertThat(entry.getOldValues()[2]).isNull();
+    }
+
+    @Test
+    @FixFor("DBZ-3401")
+    public void shouldMapStoredColumnLayoutAroundVirtualColumns() throws Exception {
+        // Virtual columns occupy a relational model position but no stored segment; the layout
+        // mapping must target the model position of each stored column by name.
+        final Table table = Table.editor()
+                .tableId(TableId.parse("DEBEZIUM.DBZVIRTUAL"))
+                .addColumn(Column.editor().name("ID").create())
+                .addColumn(Column.editor().name("GEN").generated(true).create())
+                .addColumn(Column.editor().name("DATA").create())
+                .create();
+
+        columnResolverDmlParser.setStoredColumnLayoutProvider(tableId -> Arrays.asList(
+                new LogMinerColumnResolverDmlParser.StoredColumn("ID", 1, false),
+                new LogMinerColumnResolverDmlParser.StoredColumn("DATA", 2, false)));
+
+        final String sql = "insert into \"DEBEZIUM\".\"DBZVIRTUAL\" (\"COL 1\",\"COL 2\") values (HEXTORAW('a'),HEXTORAW('b'));";
+        final LogMinerDmlEntry entry = columnResolverDmlParser.parse(sql, table);
+        assertThat(entry.getEventType()).isEqualTo(EventType.INSERT);
+        assertThat(entry.getNewValues()).hasSize(3);
+        assertThat(entry.getNewValues()[0]).isEqualTo("HEXTORAW('a')");
+        assertThat(entry.getNewValues()[1]).isNull();
+        assertThat(entry.getNewValues()[2]).isEqualTo("HEXTORAW('b')");
+    }
+
+    @Test
+    @FixFor("DBZ-3401")
+    public void shouldQueryStoredColumnLayoutOncePerTableUntilEvicted() throws Exception {
+        final TableId tableId = TableId.parse("DEBEZIUM.DBZLAYOUTCACHE");
+        final Table table = Table.editor()
+                .tableId(tableId)
+                .addColumn(Column.editor().name("ID").create())
+                .addColumn(Column.editor().name("DATA").create())
+                .create();
+
+        final AtomicInteger lookups = new AtomicInteger();
+        columnResolverDmlParser.setStoredColumnLayoutProvider(id -> {
+            lookups.incrementAndGet();
+            return Arrays.asList(
+                    new LogMinerColumnResolverDmlParser.StoredColumn("ID", 1, false),
+                    new LogMinerColumnResolverDmlParser.StoredColumn("DATA", 2, false));
+        });
+
+        final String sql = "insert into \"DEBEZIUM\".\"DBZLAYOUTCACHE\" (\"COL 1\",\"COL 2\") values (HEXTORAW('a'),HEXTORAW('b'));";
+        columnResolverDmlParser.parse(sql, table);
+        columnResolverDmlParser.parse(sql, table);
+        assertThat(lookups.get()).isEqualTo(1);
+
+        columnResolverDmlParser.removeTableFromCache(tableId);
+        columnResolverDmlParser.parse(sql, table);
+        assertThat(lookups.get()).isEqualTo(2);
+    }
+
+    @Test
+    @FixFor("DBZ-3401")
+    public void shouldFallBackToPositionalMappingWithoutStoredColumnLayout() throws Exception {
+        // Provider returning null (e.g. layout lookup failed) must preserve the upstream
+        // positional behavior.
+        final Table table = Table.editor()
+                .tableId(TableId.parse("DEBEZIUM.DBZFALLBACK"))
+                .addColumn(Column.editor().name("ID").create())
+                .addColumn(Column.editor().name("DATA").create())
+                .create();
+
+        columnResolverDmlParser.setStoredColumnLayoutProvider(tableId -> null);
+
+        final String sql = "insert into \"DEBEZIUM\".\"DBZFALLBACK\" (\"COL 1\",\"COL 2\") values (HEXTORAW('a'),HEXTORAW('b'));";
+        final LogMinerDmlEntry entry = columnResolverDmlParser.parse(sql, table);
+        assertThat(entry.getEventType()).isEqualTo(EventType.INSERT);
+        assertThat(entry.getNewValues()).hasSize(2);
+        assertThat(entry.getNewValues()[0]).isEqualTo("HEXTORAW('a')");
+        assertThat(entry.getNewValues()[1]).isEqualTo("HEXTORAW('b')");
     }
 }

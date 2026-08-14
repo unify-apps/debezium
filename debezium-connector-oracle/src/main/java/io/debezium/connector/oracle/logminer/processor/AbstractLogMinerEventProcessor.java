@@ -11,8 +11,10 @@ import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
@@ -116,6 +118,12 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
         this.counters = new Counters();
         this.dmlParser = new LogMinerDmlParser();
         this.reconstructColumnDmlParser = new LogMinerColumnResolverDmlParser();
+        // LogMiner's COL-x placeholder numbering follows the stored-segment layout, which includes
+        // hidden stored columns (e.g. the bitmap column created by a fast ADD COLUMN ... DEFAULT)
+        // that the relational model does not contain. Provide the physical layout so the resolver
+        // parser aligns placeholders correctly and skips hidden column values; on any failure the
+        // resolver falls back to the positional model mapping.
+        this.reconstructColumnDmlParser.setStoredColumnLayoutProvider(this::getTableStoredColumnLayout);
         this.selectLobParser = new SelectLobParser();
     }
 
@@ -968,6 +976,44 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
 
     private boolean isUsingHybridStrategy() {
         return OracleConnectorConfig.LogMiningStrategy.HYBRID.equals(connectorConfig.getLogMiningStrategy());
+    }
+
+    /**
+     * Fetches the table's physically stored column layout, i.e. the columns that occupy a stored
+     * segment position ({@code ALL_TAB_COLS.SEGMENT_COLUMN_ID}), in segment order, including hidden
+     * stored columns and excluding virtual columns. This is the numbering that LogMiner's
+     * {@code COL x} placeholders follow in reconstructed SQL.
+     * <p>
+     * The lookup runs at most once per table between schema changes: the resolver parser caches the
+     * resulting mapping and the cache entry is evicted when a schema change for the table is
+     * dispatched.
+     *
+     * @param tableId the table identifier, should not be {@code null}
+     * @return the stored columns in segment order, or {@code null} when the layout could not be
+     *         obtained and the caller should fall back to the positional mapping
+     */
+    private List<LogMinerColumnResolverDmlParser.StoredColumn> getTableStoredColumnLayout(TableId tableId) {
+        try (OracleConnection connection = createOutOfBandsConnection()) {
+            return connection.prepareQueryAndMap(
+                    "SELECT COLUMN_NAME, SEGMENT_COLUMN_ID, HIDDEN_COLUMN FROM ALL_TAB_COLS "
+                            + "WHERE OWNER=? AND TABLE_NAME=? AND SEGMENT_COLUMN_ID IS NOT NULL ORDER BY SEGMENT_COLUMN_ID",
+                    ps -> {
+                        ps.setString(1, tableId.schema());
+                        ps.setString(2, tableId.table());
+                    },
+                    rs -> {
+                        final List<LogMinerColumnResolverDmlParser.StoredColumn> layout = new ArrayList<>();
+                        while (rs.next()) {
+                            layout.add(new LogMinerColumnResolverDmlParser.StoredColumn(
+                                    rs.getString(1), rs.getInt(2), "YES".equalsIgnoreCase(rs.getString(3))));
+                        }
+                        return layout;
+                    });
+        }
+        catch (Exception e) {
+            LOGGER.warn("Failed to load the stored-column layout for table {}; falling back to positional COL-x mapping", tableId, e);
+            return null;
+        }
     }
 
     /**

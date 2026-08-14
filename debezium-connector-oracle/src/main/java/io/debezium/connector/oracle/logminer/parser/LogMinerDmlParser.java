@@ -5,6 +5,9 @@
  */
 package io.debezium.connector.oracle.logminer.parser;
 
+import java.util.ArrayList;
+import java.util.List;
+
 import io.debezium.DebeziumException;
 import io.debezium.connector.oracle.logminer.LogMinerHelper;
 import io.debezium.relational.Table;
@@ -111,8 +114,12 @@ public class LogMinerDmlParser implements DmlParser {
             index = parseTableName(sql, index);
 
             // capture column names
-            String[] columnNames = new String[table.columns().size()];
-            index = parseColumnListClause(sql, index, columnNames);
+            // A reconstructed statement can list more columns than the relational model knows,
+            // e.g. hidden stored columns under the column-resolver parser, so the names are
+            // collected dynamically rather than into a model-sized array.
+            final List<String> columnNamesList = new ArrayList<>(table.columns().size());
+            index = parseColumnListClause(sql, index, columnNamesList);
+            String[] columnNames = columnNamesList.toArray(new String[0]);
 
             // capture values
             Object[] newValues = new Object[table.columns().size()];
@@ -235,10 +242,9 @@ public class LogMinerDmlParser implements DmlParser {
      * @param columnNames the list that will be populated with the column names
      * @return the index into the sql string where the column-list clause ended
      */
-    private int parseColumnListClause(String sql, int start, String[] columnNames) {
+    private int parseColumnListClause(String sql, int start, List<String> columnNames) {
         int index = start;
         boolean inQuote = false;
-        int columnIndex = 0;
         for (; index < sql.length(); ++index) {
             char c = sql.charAt(index);
             if (c == '(' && !inQuote) {
@@ -251,7 +257,7 @@ public class LogMinerDmlParser implements DmlParser {
             else if (c == '"') {
                 if (inQuote) {
                     inQuote = false;
-                    columnNames[columnIndex++] = sql.substring(start + 1, index);
+                    columnNames.add(sql.substring(start + 1, index));
                     start = index + 2;
                     continue;
                 }
@@ -328,7 +334,9 @@ public class LogMinerDmlParser implements DmlParser {
                 if (sql.charAt(start) == '\'' && sql.charAt(index - 1) == '\'') {
                     // value is single-quoted at the start/end, substring without the quotes.
                     int position = getColumnIndexByName(columnNames[columnIndex], table);
-                    values[position] = collectedValue.toString();
+                    if (position >= 0) {
+                        values[position] = collectedValue.toString();
+                    }
                     collectedValue = null;
                 }
                 else {
@@ -336,7 +344,9 @@ public class LogMinerDmlParser implements DmlParser {
                     String s = sql.substring(start, index);
                     if (!s.equals(UNSUPPORTED_TYPE) && !s.equals(NULL)) {
                         int position = getColumnIndexByName(columnNames[columnIndex], table);
-                        values[position] = s;
+                        if (position >= 0) {
+                            values[position] = s;
+                        }
                     }
                 }
 
@@ -439,7 +449,9 @@ public class LogMinerDmlParser implements DmlParser {
                     inSingleQuote = false;
                     if (nested == 0) {
                         int position = getColumnIndexByName(currentColumnName, table);
-                        newValues[position] = collectedValue.toString();
+                        if (position >= 0) {
+                            newValues[position] = collectedValue.toString();
+                        }
                         collectedValue = null;
                         start = index + 1;
                         inColumnValue = false;
@@ -481,7 +493,9 @@ public class LogMinerDmlParser implements DmlParser {
                             // This sentinel value will be cleared later when we reconcile before/after
                             // state in parseUpdate()
                             int position = getColumnIndexByName(currentColumnName, table);
-                            newValues[position] = NULL_SENTINEL;
+                            if (position >= 0) {
+                                newValues[position] = NULL_SENTINEL;
+                            }
                         }
                         start = index + 1;
                         inColumnValue = false;
@@ -493,7 +507,9 @@ public class LogMinerDmlParser implements DmlParser {
                         continue;
                     }
                     int position = getColumnIndexByName(currentColumnName, table);
-                    newValues[position] = value;
+                    if (position >= 0) {
+                        newValues[position] = value;
+                    }
                     start = index + 1;
                     inColumnValue = false;
                     inSpecial = false;
@@ -600,7 +616,9 @@ public class LogMinerDmlParser implements DmlParser {
                     inSingleQuote = false;
                     if (nested == 0) {
                         int position = getColumnIndexByName(currentColumnName, table);
-                        values[position] = collectedValue.toString();
+                        if (position >= 0) {
+                            values[position] = collectedValue.toString();
+                        }
                         collectedValue = null;
                         start = index + 1;
                         inColumnValue = false;
@@ -651,7 +669,9 @@ public class LogMinerDmlParser implements DmlParser {
                         continue;
                     }
                     int position = getColumnIndexByName(currentColumnName, table);
-                    values[position] = value;
+                    if (position >= 0) {
+                        values[position] = value;
+                    }
                     start = index + 1;
                     inColumnValue = false;
                     inSpecial = false;
