@@ -11,8 +11,10 @@ import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
@@ -43,6 +45,7 @@ import io.debezium.connector.oracle.logminer.events.LogMinerEventRow;
 import io.debezium.connector.oracle.logminer.events.SelectLobLocatorEvent;
 import io.debezium.connector.oracle.logminer.events.TruncateEvent;
 import io.debezium.connector.oracle.logminer.parser.DmlParserException;
+import io.debezium.connector.oracle.logminer.parser.LogMinerColumnResolverDmlParser;
 import io.debezium.connector.oracle.logminer.parser.LogMinerDmlEntry;
 import io.debezium.connector.oracle.logminer.parser.LogMinerDmlEntryImpl;
 import io.debezium.connector.oracle.logminer.parser.LogMinerDmlParser;
@@ -65,6 +68,21 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
     private static final Logger LOGGER = LoggerFactory.getLogger(AbstractLogMinerEventProcessor.class);
     private static final String NO_SEQUENCE_TRX_ID_SUFFIX = "ffffffff";
 
+    /**
+     * Table name prefix reported by LogMiner for an object dropped and purged ({@code OBJ# <n>}).
+     */
+    private static final String UNKNOWN_TABLE_PREFIX = "OBJ# ";
+
+    /**
+     * Table name reported by LogMiner when the object name could not be resolved at all.
+     */
+    private static final String UNKNOWN_TABLE_NAME = "UNKNOWN";
+
+    /**
+     * Table name prefix of an object dropped but not yet purged from the recycle bin.
+     */
+    private static final String RECYCLEBIN_TABLE_PREFIX = "BIN$";
+
     private final ChangeEventSourceContext context;
     private final OracleConnectorConfig connectorConfig;
     private final OracleDatabaseSchema schema;
@@ -73,6 +91,7 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
     private final EventDispatcher<OraclePartition, TableId> dispatcher;
     private final OracleStreamingChangeEventSourceMetrics metrics;
     private final LogMinerDmlParser dmlParser;
+    private final LogMinerColumnResolverDmlParser reconstructColumnDmlParser;
     private final SelectLobParser selectLobParser;
 
     protected final Counters counters;
@@ -98,6 +117,13 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
         this.metrics = metrics;
         this.counters = new Counters();
         this.dmlParser = new LogMinerDmlParser();
+        this.reconstructColumnDmlParser = new LogMinerColumnResolverDmlParser();
+        // LogMiner's COL-x placeholder numbering follows the stored-segment layout, which includes
+        // hidden stored columns (e.g. the bitmap column created by a fast ADD COLUMN ... DEFAULT)
+        // that the relational model does not contain. Provide the physical layout so the resolver
+        // parser aligns placeholders correctly and skips hidden column values; on any failure the
+        // resolver falls back to the positional model mapping.
+        this.reconstructColumnDmlParser.setStoredColumnLayoutProvider(this::getTableStoredColumnLayout);
         this.selectLobParser = new SelectLobParser();
     }
 
@@ -605,11 +631,21 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
                             tableId,
                             tableId.catalog(),
                             tableId.schema(),
+                            row.getObjectId() != 0 ? row.getObjectId() : null,
+                            // DDL events do not reliably populate the data object id (e.g. ALTER TABLE);
+                            // registering by object id alone matches lookups for any data object id.
+                            null,
                             row.getRedoSql(),
                             getSchema(),
                             row.getChangeTime(),
                             metrics,
                             () -> processTruncateEvent(row)));
+
+            if (isUsingHybridStrategy()) {
+                // The table's column layout may have changed; evict it from the column-based DML
+                // parser's position cache so it is recomputed on the next reconstruction (DBZ-8597).
+                reconstructColumnDmlParser.removeTableFromCache(tableId);
+            }
         }
     }
 
@@ -728,7 +764,11 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
         // value in the INFO column, and the record can be managed by the connector successfully,
         // so to be backward compatible, we only explicitly trigger this behavior if there is an
         // error reason for STATUS=2 in the INFO column as well as STATUS=2.
-        if (row.getStatus() == 2 && !Strings.isNullOrBlank(row.getInfo())) {
+        //
+        // Under the hybrid mining strategy such rows are not skipped: the SQL is reconstructed from
+        // the relational model by the column-resolver DML parser instead (DBZ-3401). The behavior of
+        // every other strategy is deliberately unchanged.
+        if (row.getStatus() == 2 && !Strings.isNullOrBlank(row.getInfo()) && !isUsingHybridStrategy()) {
             // The SQL in the SQL_REDO column is not valid and cannot be parsed.
             switch (connectorConfig.getEventProcessingFailureHandlingMode()) {
                 case FAIL:
@@ -773,7 +813,7 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
         }
 
         addToTransaction(row.getTransactionId(), row, () -> {
-            final LogMinerDmlEntry dmlEntry = parseDmlStatement(row.getRedoSql(), table, row.getTransactionId());
+            final LogMinerDmlEntry dmlEntry = parseDmlStatement(row, table);
             dmlEntry.setObjectName(row.getTableName());
             dmlEntry.setObjectOwner(row.getTablespaceName());
             return new DmlEvent(row, dmlEntry);
@@ -820,7 +860,10 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
     }
 
     private Table getTableForDataEvent(LogMinerEventRow row) throws SQLException, InterruptedException {
-        final TableId tableId = row.getTableId();
+        final TableId tableId = getTableIdForDataEvent(row);
+        if (tableId == null) {
+            return null;
+        }
         Table table = getSchema().tableFor(tableId);
         if (table == null) {
             if (!getConfig().getTableFilters().dataCollectionFilter().isIncluded(tableId)) {
@@ -829,6 +872,148 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
             table = dispatchSchemaChangeEventAndGetTableForNewCapturedTable(tableId, offsetContext, dispatcher);
         }
         return table;
+    }
+
+    /**
+     * Resolves the relational table identifier for a DML data event.
+     *
+     * Under the hybrid mining strategy, LogMiner cannot always resolve the object's name: an object
+     * dropped but not yet purged is reported with its recycle-bin {@code BIN$...} name, and an object
+     * dropped and purged is reported as {@code OBJ# <n>} or {@code UNKNOWN}. These are resolved back
+     * to the original table identifier here (upstream DBZ-3401, in the post-DBZ-8925 form).
+     *
+     * @param row the result set row, should not be {@code null}
+     * @return the resolved table identifier, or {@code null} if the event should be skipped because
+     *         the identifier could not be resolved and the failure handling mode is not FAIL
+     * @throws SQLException if a database exception occurred
+     */
+    private TableId getTableIdForDataEvent(LogMinerEventRow row) throws SQLException {
+        final TableId tableId = row.getTableId();
+        if (tableId != null && isUsingHybridStrategy()) {
+            if (tableId.table().startsWith(RECYCLEBIN_TABLE_PREFIX)) {
+                // Object was dropped but has not been purged; resolve the original name from the recycle bin.
+                try (OracleConnection connection = createOutOfBandsConnection()) {
+                    return connection.prepareQueryAndMap("SELECT OWNER, ORIGINAL_NAME FROM DBA_RECYCLEBIN WHERE OBJECT_NAME=?",
+                            ps -> ps.setString(1, tableId.table()),
+                            rs -> {
+                                if (rs.next()) {
+                                    return new TableId(tableId.catalog(), rs.getString(1), rs.getString(2));
+                                }
+                                return tableId;
+                            });
+                }
+            }
+            else if (tableId.table().startsWith(UNKNOWN_TABLE_PREFIX) || UNKNOWN_TABLE_NAME.equalsIgnoreCase(tableId.table())) {
+                // Object has been dropped and purged; the only option is to resolve the table by object id.
+                return resolveTableIdByObjectId(row);
+            }
+        }
+        return tableId;
+    }
+
+    /**
+     * Resolves a table identifier by the event row's object id, consulting the schema's object-id
+     * registry first and falling back to a live {@code ALL_OBJECTS} lookup. Unresolvable object ids
+     * are negatively cached (upstream DBZ-8399 semantics) and handled according to the configured
+     * {@code event.processing.failure.handling.mode} (upstream DBZ-8208 semantics).
+     *
+     * @param row the result set row, should not be {@code null}
+     * @return the resolved table identifier, or {@code null} if the event should be skipped
+     * @throws SQLException if a database exception occurred
+     */
+    private TableId resolveTableIdByObjectId(LogMinerEventRow row) throws SQLException {
+        final Long objectId = row.getObjectId() != 0 ? row.getObjectId() : null;
+        final Long dataObjectId = row.getDataObjectId() != 0 ? row.getDataObjectId() : null;
+        if (objectId != null) {
+            final TableId registered = getSchema().getTableIdByObjectId(objectId, dataObjectId);
+            if (registered != null) {
+                return registered;
+            }
+            if (!getSchema().isObjectIdUnresolvable(objectId)) {
+                // The object id has not been seen before; a table created after streaming started may
+                // not be registered yet, so attempt a live lookup. A dropped and purged object cannot
+                // be resolved this way and is negatively cached to avoid repeated lookups.
+                try (OracleConnection connection = createOutOfBandsConnection()) {
+                    final TableId resolved = connection.resolveTableIdByObjectId(objectId, row.getTableId().catalog());
+                    if (resolved != null) {
+                        getSchema().registerTableObjectId(resolved, objectId, dataObjectId);
+                        return resolved;
+                    }
+                }
+                getSchema().registerUnresolvableObjectId(objectId);
+            }
+        }
+
+        switch (connectorConfig.getEventProcessingFailureHandlingMode()) {
+            case FAIL:
+                LOGGER.error("Failed to resolve table name by object id lookup for event '{}'", row);
+                throw new DebeziumException("Failed to resolve table name by object id " + objectId + " lookup");
+            case WARN:
+                LOGGER.warn("Failed to resolve table name by object id {} lookup. The event '{}' will be ignored and skipped.", objectId, row);
+                metrics.incrementWarningCount();
+                return null;
+            default:
+                LOGGER.debug("Failed to resolve table name by object id {} lookup. The event '{}' will be ignored and skipped.", objectId, row);
+                return null;
+        }
+    }
+
+    /**
+     * Creates a short-lived out-of-bands connection for lookups performed while the LogMiner result
+     * set is being processed, positioned to the PDB when one is configured.
+     *
+     * @return the connection, never {@code null}; the caller is responsible for closing it
+     * @throws SQLException if a database exception occurred
+     */
+    private OracleConnection createOutOfBandsConnection() throws SQLException {
+        final OracleConnection connection = new OracleConnection(connectorConfig.getJdbcConfig(), () -> getClass().getClassLoader(), false);
+        final String pdbName = getConfig().getPdbName();
+        if (pdbName != null) {
+            connection.setSessionToPdb(pdbName);
+        }
+        return connection;
+    }
+
+    private boolean isUsingHybridStrategy() {
+        return OracleConnectorConfig.LogMiningStrategy.HYBRID.equals(connectorConfig.getLogMiningStrategy());
+    }
+
+    /**
+     * Fetches the table's physically stored column layout, i.e. the columns that occupy a stored
+     * segment position ({@code ALL_TAB_COLS.SEGMENT_COLUMN_ID}), in segment order, including hidden
+     * stored columns and excluding virtual columns. This is the numbering that LogMiner's
+     * {@code COL x} placeholders follow in reconstructed SQL.
+     * <p>
+     * The lookup runs at most once per table between schema changes: the resolver parser caches the
+     * resulting mapping and the cache entry is evicted when a schema change for the table is
+     * dispatched.
+     *
+     * @param tableId the table identifier, should not be {@code null}
+     * @return the stored columns in segment order, or {@code null} when the layout could not be
+     *         obtained and the caller should fall back to the positional mapping
+     */
+    private List<LogMinerColumnResolverDmlParser.StoredColumn> getTableStoredColumnLayout(TableId tableId) {
+        try (OracleConnection connection = createOutOfBandsConnection()) {
+            return connection.prepareQueryAndMap(
+                    "SELECT COLUMN_NAME, SEGMENT_COLUMN_ID, HIDDEN_COLUMN FROM ALL_TAB_COLS "
+                            + "WHERE OWNER=? AND TABLE_NAME=? AND SEGMENT_COLUMN_ID IS NOT NULL ORDER BY SEGMENT_COLUMN_ID",
+                    ps -> {
+                        ps.setString(1, tableId.schema());
+                        ps.setString(2, tableId.table());
+                    },
+                    rs -> {
+                        final List<LogMinerColumnResolverDmlParser.StoredColumn> layout = new ArrayList<>();
+                        while (rs.next()) {
+                            layout.add(new LogMinerColumnResolverDmlParser.StoredColumn(
+                                    rs.getString(1), rs.getInt(2), "YES".equalsIgnoreCase(rs.getString(3))));
+                        }
+                        return layout;
+                    });
+        }
+        catch (Exception e) {
+            LOGGER.warn("Failed to load the stored-column layout for table {}; falling back to positional COL-x mapping", tableId, e);
+            return null;
+        }
     }
 
     /**
@@ -902,6 +1087,39 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
     protected abstract void addToTransaction(String transactionId, LogMinerEventRow row, Supplier<LogMinerEvent> eventSupplier);
 
     /**
+     * Materializes an event from its supplier, honoring the configured
+     * {@code event.processing.failure.handling.mode} when the DML statement cannot be parsed
+     * (upstream DBZ-8208 semantics). Implementations of
+     * {@link #addToTransaction(String, LogMinerEventRow, Supplier)} must obtain the event through
+     * this method rather than invoking the supplier directly.
+     *
+     * @param row the result set row the event originates from, should not be {@code null}
+     * @param eventSupplier the event supplier, should not be {@code null}
+     * @return the supplied event, or {@code null} if the event could not be parsed and the failure
+     *         handling mode is not FAIL, in which case the event must be skipped
+     */
+    protected LogMinerEvent getEventFromSupplier(LogMinerEventRow row, Supplier<LogMinerEvent> eventSupplier) {
+        try {
+            return eventSupplier.get();
+        }
+        catch (DmlParserException e) {
+            switch (connectorConfig.getEventProcessingFailureHandlingMode()) {
+                case FAIL:
+                    LOGGER.error("Failed to parse SQL for event '{}'", row);
+                    throw e;
+                case WARN:
+                    LOGGER.warn("Failed to parse SQL '{}'. The event '{}' is being ignored and skipped.", row.getRedoSql(), row);
+                    metrics.incrementWarningCount();
+                    return null;
+                default:
+                    // In this case, we explicitly log the situation in "debug" only and not as an error/warn.
+                    LOGGER.debug("Failed to parse SQL for event '{}'. This event is being ignored and skipped.", row);
+                    return null;
+            }
+        }
+    }
+
+    /**
      * Dispatch a schema change event for a new table and get the newly created relational table model.
      *
      * @param tableId the unique table identifier, must not be {@code null}
@@ -926,6 +1144,15 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
             return null;
         }
 
+        Long objectId = null;
+        Long dataObjectId = null;
+        if (isUsingHybridStrategy()) {
+            try (OracleConnection connection = createOutOfBandsConnection()) {
+                objectId = connection.getTableObjectId(tableId);
+                dataObjectId = connection.getTableDataObjectId(tableId);
+            }
+        }
+
         LOGGER.info("Table '{}' is new and will now be captured.", tableId);
         offsetContext.event(tableId, Instant.now());
         dispatcher.dispatchSchemaChangeEvent(partition,
@@ -936,6 +1163,8 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
                         tableId,
                         tableId.catalog(),
                         tableId.schema(),
+                        objectId,
+                        dataObjectId,
                         tableDdl,
                         getSchema(),
                         Instant.now(),
@@ -971,16 +1200,16 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
     /**
      * Parse a DML redo SQL statement.
      *
-     * @param redoSql the redo SQL statement
+     * @param row the result set row
      * @param table the table the SQL statement is for
-     * @param transactionId the associated transaction id for the SQL statement
      * @return a parse object for the redo SQL statement
      */
-    private LogMinerDmlEntry parseDmlStatement(String redoSql, Table table, String transactionId) {
+    private LogMinerDmlEntry parseDmlStatement(LogMinerEventRow row, Table table) {
+        final String redoSql = row.getRedoSql();
         LogMinerDmlEntry dmlEntry;
         try {
             Instant parseStart = Instant.now();
-            dmlEntry = dmlParser.parse(redoSql, table);
+            dmlEntry = resolveParser(row).parse(redoSql, table);
             metrics.addCurrentParseTime(Duration.between(parseStart, Instant.now()));
         }
         catch (DmlParserException e) {
@@ -997,6 +1226,23 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
         }
 
         return dmlEntry;
+    }
+
+    /**
+     * Resolves which DML parser implementation should parse the event row.
+     *
+     * When using the hybrid mining strategy and the row's SQL could not be reconstructed by LogMiner
+     * ({@code STATUS=2} with an error reason in {@code INFO}), the column-resolver parser is used to
+     * reconstruct the statement from the relational model; otherwise the standard parser is used.
+     *
+     * @param row the result set row, should not be {@code null}
+     * @return the parser to use, never {@code null}
+     */
+    private LogMinerDmlParser resolveParser(LogMinerEventRow row) {
+        if (row.getStatus() == 2 && !Strings.isNullOrBlank(row.getInfo()) && isUsingHybridStrategy()) {
+            return reconstructColumnDmlParser;
+        }
+        return dmlParser;
     }
 
     private static Pattern LOB_WRITE_SQL_PATTERN = Pattern.compile(

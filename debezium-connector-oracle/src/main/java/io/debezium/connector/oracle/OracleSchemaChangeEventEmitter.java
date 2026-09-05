@@ -15,6 +15,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.connector.oracle.antlr.OracleDdlParser;
+import io.debezium.connector.oracle.logminer.LogMinerAdapter;
 import io.debezium.connector.oracle.logminer.processor.TruncateReceiver;
 import io.debezium.pipeline.spi.SchemaChangeEventEmitter;
 import io.debezium.relational.Table;
@@ -49,11 +50,24 @@ public class OracleSchemaChangeEventEmitter implements SchemaChangeEventEmitter 
     private final TableFilter filters;
     private final OracleStreamingChangeEventSourceMetrics streamingMetrics;
     private final TruncateReceiver truncateReceiver;
+    private final OracleConnectorConfig connectorConfig;
+    private final Long objectId;
+    private final Long dataObjectId;
 
     public OracleSchemaChangeEventEmitter(OracleConnectorConfig connectorConfig, OraclePartition partition,
                                           OracleOffsetContext offsetContext, TableId tableId, String sourceDatabaseName,
                                           String objectOwner, String ddlText, OracleDatabaseSchema schema,
                                           Instant changeTime, OracleStreamingChangeEventSourceMetrics streamingMetrics,
+                                          TruncateReceiver truncateReceiver) {
+        this(connectorConfig, partition, offsetContext, tableId, sourceDatabaseName, objectOwner, null, null,
+                ddlText, schema, changeTime, streamingMetrics, truncateReceiver);
+    }
+
+    public OracleSchemaChangeEventEmitter(OracleConnectorConfig connectorConfig, OraclePartition partition,
+                                          OracleOffsetContext offsetContext, TableId tableId, String sourceDatabaseName,
+                                          String objectOwner, Long objectId, Long dataObjectId, String ddlText,
+                                          OracleDatabaseSchema schema, Instant changeTime,
+                                          OracleStreamingChangeEventSourceMetrics streamingMetrics,
                                           TruncateReceiver truncateReceiver) {
         this.partition = partition;
         this.offsetContext = offsetContext;
@@ -66,6 +80,10 @@ public class OracleSchemaChangeEventEmitter implements SchemaChangeEventEmitter 
         this.streamingMetrics = streamingMetrics;
         this.filters = connectorConfig.getTableFilters().dataCollectionFilter();
         this.truncateReceiver = truncateReceiver;
+        this.connectorConfig = connectorConfig;
+        // These are only provided by the LogMiner streaming adapter
+        this.objectId = objectId;
+        this.dataObjectId = dataObjectId;
     }
 
     @Override
@@ -109,6 +127,7 @@ public class OracleSchemaChangeEventEmitter implements SchemaChangeEventEmitter 
                             changeEvents.add(dropTableEvent(partition, tableBefore, (TableDroppedEvent) event));
                             break;
                         case TRUNCATE_TABLE:
+                            registerTableObjectIds(tableId);
                             truncateReceiver.processTruncateEvent();
                             break;
                         default:
@@ -125,6 +144,7 @@ public class OracleSchemaChangeEventEmitter implements SchemaChangeEventEmitter 
     }
 
     private SchemaChangeEvent createTableEvent(OraclePartition partition, TableCreatedEvent event) {
+        registerTableObjectIds(tableId);
         offsetContext.tableEvent(tableId, changeTime);
         return SchemaChangeEvent.ofCreate(
                 partition,
@@ -141,6 +161,7 @@ public class OracleSchemaChangeEventEmitter implements SchemaChangeEventEmitter 
         tableIds.add(tableId);
         tableIds.add(event.tableId());
 
+        registerTableObjectIds(event.tableId());
         offsetContext.tableEvent(tableIds, changeTime);
         if (tableId == null) {
             return SchemaChangeEvent.ofAlter(
@@ -164,6 +185,8 @@ public class OracleSchemaChangeEventEmitter implements SchemaChangeEventEmitter 
     }
 
     private SchemaChangeEvent dropTableEvent(OraclePartition partition, Table tableSchemaBeforeDrop, TableDroppedEvent event) {
+        // Intentionally no object-id registration: the pre-drop mapping must stay intact so trailing
+        // DML events that precede the drop in the redo stream can still be resolved.
         offsetContext.tableEvent(tableId, changeTime);
         return SchemaChangeEvent.ofDrop(
                 partition,
@@ -172,5 +195,23 @@ public class OracleSchemaChangeEventEmitter implements SchemaChangeEventEmitter 
                 tableId.schema(),
                 event.statement(),
                 tableSchemaBeforeDrop);
+    }
+
+    /**
+     * Registers the DDL event's object identifiers with the schema's object-id registry.
+     *
+     * Only applies when streaming with the LogMiner adapter using the hybrid mining strategy, and only
+     * when the table is part of the relational model (upstream DBZ-3401, {@code e33901959}).
+     *
+     * @param tableId the table identifier the DDL applies to, should not be {@code null}
+     */
+    private void registerTableObjectIds(TableId tableId) {
+        if (objectId != null && connectorConfig.getAdapter() instanceof LogMinerAdapter) {
+            if (OracleConnectorConfig.LogMiningStrategy.HYBRID.equals(connectorConfig.getLogMiningStrategy())) {
+                if (schema.tableFor(tableId) != null || filters.isIncluded(tableId)) {
+                    schema.registerTableObjectId(tableId, objectId, dataObjectId);
+                }
+            }
+        }
     }
 }

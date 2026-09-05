@@ -22,6 +22,9 @@ import io.debezium.util.Strings;
 public class LogMinerQueryBuilder {
 
     private static final String LOGMNR_CONTENTS_VIEW = "V$LOGMNR_CONTENTS";
+    private static final String UNKNOWN_SCHEMA_NAME = "UNKNOWN";
+    private static final String UNKNOWN_TABLE_NAME_PREFIX = "OBJ#";
+    private static final String RECYCLEBIN_TABLE_NAME_PREFIX = "BIN$";
 
     /**
      * Builds the LogMiner contents view query.
@@ -44,7 +47,14 @@ public class LogMinerQueryBuilder {
      *     USERNAME - the name of the database user that caused the change
      *     ROW_ID - the unique identifier of the row that the change is for, may not always be set with valid value
      *     ROLLBACK - the rollback flag, value of 0 or 1.  1 implies the row was rolled back
-     *     RS_ID - the rollback segment idenifier where the change record was record from
+     *     RS_ID - the rollback segment identifier where the change record was record from
+     *     STATUS - the final LogMiner status for the row
+     *     INFO - any information data provided by LogMiner
+     *     SSN - the SQL sequence number for event ordering
+     *     THREAD# - the redo thread number
+     *     DATA_OBJ# - the data block object number identifying the object
+     *     DATA_OBJV# - the version number of the table being modified
+     *     DATA_OBJD# - the data block object number identifying the object within the tablespace
      * </pre>
      *
      * @param connectorConfig connector configuration, should not be {@code null}
@@ -54,7 +64,7 @@ public class LogMinerQueryBuilder {
     public static String build(OracleConnectorConfig connectorConfig, OracleDatabaseSchema schema) {
         final StringBuilder query = new StringBuilder(1024);
         query.append("SELECT SCN, SQL_REDO, OPERATION_CODE, TIMESTAMP, XID, CSF, TABLE_NAME, SEG_OWNER, OPERATION, ");
-        query.append("USERNAME, ROW_ID, ROLLBACK, RS_ID, STATUS, INFO, SSN, THREAD# ");
+        query.append("USERNAME, ROW_ID, ROLLBACK, RS_ID, STATUS, INFO, SSN, THREAD#, DATA_OBJ#, DATA_OBJV#, DATA_OBJD# ");
         query.append("FROM ").append(LOGMNR_CONTENTS_VIEW).append(" ");
 
         // These bind parameters will be bound when the query is executed by the caller.
@@ -183,7 +193,13 @@ public class LogMinerQueryBuilder {
         }
         else {
             List<Pattern> patterns = Strings.listOfRegex(connectorConfig.schemaIncludeList(), 0);
-            predicate.append("(").append(listOfPatternsToSql(patterns, "SEG_OWNER", false)).append(")");
+            predicate.append("(");
+            if (isUsingHybridStrategy(connectorConfig)) {
+                // LogMiner reports the schema of a dropped and purged object as UNKNOWN; such rows must
+                // reach the connector so the hybrid strategy can resolve the table by its object id.
+                predicate.append("SEG_OWNER = '").append(UNKNOWN_SCHEMA_NAME).append("' OR ");
+            }
+            predicate.append(listOfPatternsToSql(patterns, "SEG_OWNER", false)).append(")");
         }
         return predicate.toString();
     }
@@ -204,9 +220,25 @@ public class LogMinerQueryBuilder {
         }
         else {
             List<Pattern> patterns = Strings.listOfRegex(connectorConfig.tableIncludeList(), 0);
-            predicate.append("(").append(listOfPatternsToSql(patterns, "SEG_OWNER || '.' || TABLE_NAME", false)).append(")");
+            predicate.append("(");
+            if (isUsingHybridStrategy(connectorConfig)) {
+                // Makes sure we get rows that have had an issue resolving the table's object identifier
+                // due to a recent schema change causing a dictionary mismatch (upstream DBZ-8926 semantics).
+                // A dropped and purged object is reported as "OBJ# <n>"; a dropped but not yet purged
+                // object is reported with its recycle-bin "BIN$...==$0" name. Upstream's default query
+                // filter mode applies no server-side table predicate at all, so both row shapes reach the
+                // connector there; because this builder always applies the include-list predicate
+                // server-side, both prefixes must be admitted explicitly here.
+                predicate.append("TABLE_NAME LIKE '").append(UNKNOWN_TABLE_NAME_PREFIX).append("%' OR ");
+                predicate.append("TABLE_NAME LIKE '").append(RECYCLEBIN_TABLE_NAME_PREFIX).append("%' OR ");
+            }
+            predicate.append(listOfPatternsToSql(patterns, "SEG_OWNER || '.' || TABLE_NAME", false)).append(")");
         }
         return predicate.toString();
+    }
+
+    private static boolean isUsingHybridStrategy(OracleConnectorConfig connectorConfig) {
+        return OracleConnectorConfig.LogMiningStrategy.HYBRID.equals(connectorConfig.getLogMiningStrategy());
     }
 
     /**

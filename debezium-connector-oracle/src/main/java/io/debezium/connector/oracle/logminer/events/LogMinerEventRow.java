@@ -49,6 +49,9 @@ public class LogMinerEventRow {
     private static final int INFO = 15;
     private static final int SSN = 16;
     private static final int THREAD = 17;
+    private static final int OBJECT_ID = 18;
+    private static final int OBJECT_VERSION = 19;
+    private static final int OBJECT_DATA_ID = 20;
 
     private Scn scn;
     private TableId tableId;
@@ -67,6 +70,9 @@ public class LogMinerEventRow {
     private String info;
     private int ssn;
     private int thread;
+    private long objectId;
+    private long objectVersion;
+    private long dataObjectId;
 
     public Scn getScn() {
         return scn;
@@ -74,6 +80,10 @@ public class LogMinerEventRow {
 
     public TableId getTableId() {
         return tableId;
+    }
+
+    public void setTableId(TableId tableId) {
+        this.tableId = tableId;
     }
 
     public String getTableName() {
@@ -137,6 +147,27 @@ public class LogMinerEventRow {
     }
 
     /**
+     * @return the object id ({@code DATA_OBJ#}) of the object the change applies to
+     */
+    public long getObjectId() {
+        return objectId;
+    }
+
+    /**
+     * @return the object version ({@code DATA_OBJV#}) of the table being modified
+     */
+    public long getObjectVersion() {
+        return objectVersion;
+    }
+
+    /**
+     * @return the data object id ({@code DATA_OBJD#}) identifying the object within the tablespace
+     */
+    public long getDataObjectId() {
+        return dataObjectId;
+    }
+
+    /**
      * Returns a {@link LogMinerEventRow} instance based on the current row of the JDBC {@link ResultSet}.
      *
      * It's important to note that the instance returned by this method is never created as a new instance. The
@@ -181,6 +212,9 @@ public class LogMinerEventRow {
         this.info = resultSet.getString(INFO);
         this.ssn = resultSet.getInt(SSN);
         this.thread = resultSet.getInt(THREAD);
+        this.objectId = resultSet.getLong(OBJECT_ID);
+        this.objectVersion = resultSet.getLong(OBJECT_VERSION);
+        this.dataObjectId = resultSet.getLong(OBJECT_DATA_ID);
         if (this.tableName != null) {
             this.tableId = new TableId(catalogName, tablespaceName, tableName);
         }

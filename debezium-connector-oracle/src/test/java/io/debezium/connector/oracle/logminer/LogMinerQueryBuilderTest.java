@@ -61,7 +61,8 @@ public class LogMinerQueryBuilderTest {
      * {@code database.history.store.only.captured.tables.ddl} is {@code false}.
      */
     private static final String LOG_MINER_CONTENT_QUERY_TEMPLATE1 = "SELECT SCN, SQL_REDO, OPERATION_CODE, TIMESTAMP, " +
-            "XID, CSF, TABLE_NAME, SEG_OWNER, OPERATION, USERNAME, ROW_ID, ROLLBACK, RS_ID, STATUS, INFO, SSN, THREAD# " +
+            "XID, CSF, TABLE_NAME, SEG_OWNER, OPERATION, USERNAME, ROW_ID, ROLLBACK, RS_ID, STATUS, INFO, SSN, THREAD#, " +
+            "DATA_OBJ#, DATA_OBJV#, DATA_OBJD# " +
             "FROM V$LOGMNR_CONTENTS WHERE SCN > ? AND SCN <= ? " +
             "${systemTablePredicate}" +
             "AND ((" +
@@ -82,7 +83,8 @@ public class LogMinerQueryBuilderTest {
      * {@code database.history.store.only.captured.tables.ddl} is {@code true}.
      */
     private static final String LOG_MINER_CONTENT_QUERY_TEMPLATE2 = "SELECT SCN, SQL_REDO, OPERATION_CODE, TIMESTAMP, " +
-            "XID, CSF, TABLE_NAME, SEG_OWNER, OPERATION, USERNAME, ROW_ID, ROLLBACK, RS_ID, STATUS, INFO, SSN, THREAD# " +
+            "XID, CSF, TABLE_NAME, SEG_OWNER, OPERATION, USERNAME, ROW_ID, ROLLBACK, RS_ID, STATUS, INFO, SSN, THREAD#, " +
+            "DATA_OBJ#, DATA_OBJV#, DATA_OBJD# " +
             "FROM V$LOGMNR_CONTENTS WHERE SCN > ? AND SCN <= ? " +
             "${systemTablePredicate}" +
             "AND ((" +
@@ -167,6 +169,61 @@ public class LogMinerQueryBuilderTest {
         String table = "AND (NOT REGEXP_LIKE(SEG_OWNER || '.' || TABLE_NAME,'^DEBEZIUM\\.TABLEA$','i') " +
                 "AND NOT REGEXP_LIKE(SEG_OWNER || '.' || TABLE_NAME,'^DEBEZIUM\\.TABLEB$','i')) ";
         assertQueryWithConfig(TABLE_EXCLUDE_LIST, "DEBEZIUM\\.TABLEA,DEBEZIUM\\.TABLEB", null, table);
+    }
+
+    @Test
+    @FixFor({ "DBZ-3401", "DBZ-8926" })
+    public void testLogMinerQueryWithTableIncludeUsingHybridStrategy() {
+        // Under the hybrid strategy the include-list predicate must also admit rows whose table
+        // name could not be resolved by LogMiner: dropped-and-purged objects ("OBJ# <n>") and
+        // dropped-but-not-purged recycle-bin objects ("BIN$...").
+        String table = "AND (TABLE_NAME LIKE 'OBJ#%' OR TABLE_NAME LIKE 'BIN$%' " +
+                "OR REGEXP_LIKE(SEG_OWNER || '.' || TABLE_NAME,'^DEBEZIUM\\.TABLEA$','i') " +
+                "OR REGEXP_LIKE(SEG_OWNER || '.' || TABLE_NAME,'^DEBEZIUM\\.TABLEB$','i')) ";
+        Configuration config = TestHelper.defaultConfig()
+                .with(TABLE_INCLUDE_LIST, "DEBEZIUM\\.TABLEA,DEBEZIUM\\.TABLEB")
+                .with(OracleConnectorConfig.LOG_MINING_STRATEGY, "hybrid")
+                .build();
+        OracleConnectorConfig connectorConfig = new OracleConnectorConfig(config);
+        schema = createSchema(connectorConfig);
+
+        String result = LogMinerQueryBuilder.build(connectorConfig, schema);
+        assertThat(result).isEqualTo(resolveLogMineryContentQueryFromTemplate(connectorConfig, schema, null, table));
+    }
+
+    @Test
+    @FixFor({ "DBZ-3401", "DBZ-8926" })
+    public void testLogMinerQueryWithSchemaIncludeUsingHybridStrategy() {
+        // LogMiner reports the schema of a dropped and purged object as UNKNOWN.
+        String schemaPredicate = "AND (SEG_OWNER = 'UNKNOWN' " +
+                "OR REGEXP_LIKE(SEG_OWNER,'^SCHEMA1$','i') OR REGEXP_LIKE(SEG_OWNER,'^SCHEMA2$','i')) ";
+        Configuration config = TestHelper.defaultConfig()
+                .with(SCHEMA_INCLUDE_LIST, "SCHEMA1,SCHEMA2")
+                .with(OracleConnectorConfig.LOG_MINING_STRATEGY, "hybrid")
+                .build();
+        OracleConnectorConfig connectorConfig = new OracleConnectorConfig(config);
+        schema = createSchema(connectorConfig);
+
+        String result = LogMinerQueryBuilder.build(connectorConfig, schema);
+        assertThat(result).isEqualTo(resolveLogMineryContentQueryFromTemplate(connectorConfig, schema, schemaPredicate, null));
+    }
+
+    @Test
+    @FixFor({ "DBZ-3401", "DBZ-8926" })
+    public void testLogMinerQueryHybridStrategyWithoutIncludeListsMatchesDefault() {
+        // With no include lists there are no filter predicates to relax; the hybrid query must be
+        // identical to the non-hybrid query so the strategy has no effect on unfiltered mining.
+        Configuration hybridConfig = TestHelper.defaultConfig()
+                .with(OracleConnectorConfig.LOG_MINING_STRATEGY, "hybrid")
+                .build();
+        OracleConnectorConfig hybridConnectorConfig = new OracleConnectorConfig(hybridConfig);
+        schema = createSchema(hybridConnectorConfig);
+        String hybridResult = LogMinerQueryBuilder.build(hybridConnectorConfig, schema);
+
+        OracleConnectorConfig defaultConnectorConfig = new OracleConnectorConfig(TestHelper.defaultConfig().build());
+        String defaultResult = LogMinerQueryBuilder.build(defaultConnectorConfig, schema);
+
+        assertThat(hybridResult).isEqualTo(defaultResult);
     }
 
     @Test

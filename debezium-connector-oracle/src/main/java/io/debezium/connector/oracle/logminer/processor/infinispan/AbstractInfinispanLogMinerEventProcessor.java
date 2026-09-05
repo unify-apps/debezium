@@ -239,12 +239,18 @@ public abstract class AbstractInfinispanLogMinerEventProcessor extends AbstractL
                 LOGGER.trace("Transaction {} is not in cache, creating.", transactionId);
                 transaction = createTransaction(row);
             }
-            String eventKey = transaction.getEventId(transaction.getNextEventId());
-            if (!getEventCache().containsKey(eventKey)) {
-                // Add new event at eventId offset
-                LOGGER.trace("Transaction {}, adding event reference at key {}", transactionId, eventKey);
-                getEventCache().put(eventKey, eventSupplier.get());
-                metrics.calculateLagMetrics(row.getChangeTime());
+            // Materialize the event before consuming the event id so that an event skipped due to a
+            // DML parse failure (see getEventFromSupplier) does not leave a gap in the per-transaction
+            // event key sequence. This mirrors the upstream DBZ-8208 flow.
+            final LogMinerEvent event = getEventFromSupplier(row, eventSupplier);
+            if (event != null) {
+                final String eventKey = transaction.getEventId(transaction.getNextEventId());
+                if (!getEventCache().containsKey(eventKey)) {
+                    // Add new event at eventId offset
+                    LOGGER.trace("Transaction {}, adding event reference at key {}", transactionId, eventKey);
+                    getEventCache().put(eventKey, event);
+                    metrics.calculateLagMetrics(row.getChangeTime());
+                }
             }
             // When using Infinispan, this extra put is required so that the state is properly synchronized
             getTransactionCache().put(transactionId, transaction);
