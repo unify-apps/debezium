@@ -65,6 +65,10 @@ public class ChangeEventSourceCoordinator<P extends Partition, O extends OffsetC
     protected final DatabaseSchema<?> schema;
 
     private volatile boolean running;
+
+    /** Written on the change-event-source thread, read by the task thread. */
+    private volatile boolean snapshotCompleted;
+
     protected volatile StreamingChangeEventSource<P, O> streamingSource;
     protected final ReentrantLock commitOffsetLock = new ReentrantLock();
 
@@ -83,6 +87,14 @@ public class ChangeEventSourceCoordinator<P extends Partition, O extends OffsetC
         this.executor = Threads.newSingleThreadExecutor(connectorType, connectorConfig.getLogicalName(), "change-event-source-coordinator");
         this.eventDispatcher = eventDispatcher;
         this.schema = schema;
+    }
+
+    /**
+     * Whether this run's snapshot completed or was skipped. A restarted connector builds a new coordinator, so this
+     * starts out {@code false} again.
+     */
+    public boolean isSnapshotCompleted() {
+        return snapshotCompleted;
     }
 
     public synchronized void start(CdcSourceTaskContext taskContext, ChangeEventQueueMetrics changeEventQueueMetrics,
@@ -154,6 +166,12 @@ public class ChangeEventSourceCoordinator<P extends Partition, O extends OffsetC
         eventDispatcher.setEventListener(snapshotMetrics);
         SnapshotResult<O> snapshotResult = snapshotSource.execute(context, partition, previousOffset);
         LOGGER.info("Snapshot ended with {}", snapshotResult);
+
+        // Set here rather than in executeChangeEventSources, which SqlServerChangeEventSourceCoordinator overrides.
+        // The error check is for MongoDB, which reports a snapshot completed even when a replica set failed.
+        if (snapshotResult.isCompletedOrSkipped() && errorHandler.getProducerThrowable() == null) {
+            snapshotCompleted = true;
+        }
 
         if (snapshotResult.getStatus() == SnapshotResultStatus.COMPLETED || schema.tableInformationComplete()) {
             schema.assureNonEmptySchema();
