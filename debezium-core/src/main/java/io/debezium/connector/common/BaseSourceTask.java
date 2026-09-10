@@ -82,6 +82,12 @@ public abstract class BaseSourceTask<P extends Partition, O extends OffsetContex
 
     private Duration retriableRestartWait;
 
+    private volatile int snapshotMaxRestartAttempts;
+
+    /** Consecutive retriable restarts that left the snapshot unfinished. */
+    @SingleThreadAccess("polling thread")
+    private int incompleteSnapshotRestarts;
+
     private final ElapsedTimeStrategy pollOutputDelay;
     private final Clock clock = Clock.system();
 
@@ -117,6 +123,7 @@ public abstract class BaseSourceTask<P extends Partition, O extends OffsetContex
             this.props = props;
             Configuration config = Configuration.from(props);
             retriableRestartWait = config.getDuration(CommonConnectorConfig.RETRIABLE_RESTART_WAIT, ChronoUnit.MILLIS);
+            snapshotMaxRestartAttempts = config.getInteger(CommonConnectorConfig.SNAPSHOT_MAX_RESTART_ATTEMPTS);
             // need to reset the delay or you only get one delayed restart
             restartDelay = null;
             if (!config.validateAndRecord(getAllConfigurationFields(), LOGGER::error)) {
@@ -165,7 +172,21 @@ public abstract class BaseSourceTask<P extends Partition, O extends OffsetContex
             return records;
         }
         catch (RetriableException e) {
+            // Read before stop(), which stops the coordinator this asks
+            final boolean snapshotUnfinished = coordinator != null && !coordinator.isSnapshotCompleted();
             stop(true);
+
+            if (!snapshotUnfinished) {
+                incompleteSnapshotRestarts = 0;
+                throw e;
+            }
+            if (snapshotMaxRestartAttempts >= 0 && ++incompleteSnapshotRestarts > snapshotMaxRestartAttempts) {
+                throw new ConnectException("Restarted " + incompleteSnapshotRestarts + " times after a retriable error "
+                        + "without the snapshot completing, more than "
+                        + CommonConnectorConfig.SNAPSHOT_MAX_RESTART_ATTEMPTS.name() + " allows ("
+                        + snapshotMaxRestartAttempts + "). Each restart re-reads the source from the first table, so "
+                        + "the connector is failing instead of restarting again.", e);
+            }
             throw e;
         }
     }
