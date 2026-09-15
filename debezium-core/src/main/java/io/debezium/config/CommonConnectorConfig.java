@@ -319,20 +319,22 @@ public abstract class CommonConnectorConfig {
                     "Time to wait before restarting connector after retriable exception occurs. Defaults to " + DEFAULT_RETRIABLE_RESTART_WAIT + "ms.")
             .withValidation(Field::isPositiveLong);
 
-    public static final int DEFAULT_SNAPSHOT_MAX_RESTART_ATTEMPTS = -1;
+    public static final int DEFAULT_RETRIABLE_RESTART_MAX_ATTEMPTS = -1;
 
-    public static final Field SNAPSHOT_MAX_RESTART_ATTEMPTS = Field.create("snapshot.max.restart.attempts")
-            .withDisplayName("Maximum snapshot restart attempts")
+    public static final Field RETRIABLE_RESTART_MAX_ATTEMPTS = Field.create("retriable.restart.connector.max.attempts")
+            .withDisplayName("Maximum connector restarts after a retriable error")
             .withType(Type.INT)
             .withGroup(Field.createGroupEntry(Field.Group.ADVANCED, 19))
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
-            .withDefault(DEFAULT_SNAPSHOT_MAX_RESTART_ATTEMPTS)
-            .withDescription("How many times a retriable error may restart the connector while its snapshot has not "
-                    + "completed. A snapshot keeps no resumable offset, so each such restart re-reads the source from "
-                    + "the first table; past the limit the connector fails instead of restarting again. Restarts "
-                    + "after a completed snapshot resume from the stored offset and are not limited. Defaults to "
-                    + DEFAULT_SNAPSHOT_MAX_RESTART_ATTEMPTS + ", no limit.")
+            .withDefault(DEFAULT_RETRIABLE_RESTART_MAX_ATTEMPTS)
+            .withDescription("How many times a retriable error may restart the connector without it working again in "
+                    + "between. The count is cleared by any poll that succeeds once the snapshot is complete, "
+                    + "including an empty one, since a source with no changes is not a failing source. Polls during "
+                    + "a snapshot do not clear it, because a restart re-reads them from the first table. Past the "
+                    + "limit the connector fails instead of restarting again, which is what lets the host "
+                    + "application see a connector that has been retrying forever without progressing. Defaults to "
+                    + DEFAULT_RETRIABLE_RESTART_MAX_ATTEMPTS + ", no limit.")
             .withValidation(Field::isInteger);
 
     public static final Field TOMBSTONES_ON_DELETE = Field.create("tombstones.on.delete")
@@ -582,7 +584,7 @@ public abstract class CommonConnectorConfig {
                     SNAPSHOT_FETCH_SIZE,
                     SNAPSHOT_MAX_THREADS,
                     RETRIABLE_RESTART_WAIT,
-                    SNAPSHOT_MAX_RESTART_ATTEMPTS,
+                    RETRIABLE_RESTART_MAX_ATTEMPTS,
                     QUERY_FETCH_SIZE)
             .events(
                     CUSTOM_CONVERTERS,

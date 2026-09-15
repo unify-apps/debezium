@@ -91,7 +91,9 @@ public class ChangeEventSourceCoordinator<P extends Partition, O extends OffsetC
 
     /**
      * Whether this run's snapshot completed or was skipped. A restarted connector builds a new coordinator, so this
-     * starts out {@code false} again.
+     * starts out {@code false} again, and is true early on when a stored offset let the restart skip the snapshot.
+     * That is what tells a caller whether a successful poll means the connector is working or is only re-reading a
+     * table it will read again after the next restart.
      */
     public boolean isSnapshotCompleted() {
         return snapshotCompleted;

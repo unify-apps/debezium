@@ -82,11 +82,10 @@ public abstract class BaseSourceTask<P extends Partition, O extends OffsetContex
 
     private Duration retriableRestartWait;
 
-    private volatile int snapshotMaxRestartAttempts;
+    private volatile int maxRetriableRestarts = CommonConnectorConfig.DEFAULT_RETRIABLE_RESTART_MAX_ATTEMPTS;
 
-    /** Consecutive retriable restarts that left the snapshot unfinished. */
-    @SingleThreadAccess("polling thread")
-    private int incompleteSnapshotRestarts;
+    /** Consecutive retriable restarts not followed by the connector working again. Only the polling thread writes it. */
+    private volatile int retriableRestarts;
 
     private final ElapsedTimeStrategy pollOutputDelay;
     private final Clock clock = Clock.system();
@@ -123,7 +122,7 @@ public abstract class BaseSourceTask<P extends Partition, O extends OffsetContex
             this.props = props;
             Configuration config = Configuration.from(props);
             retriableRestartWait = config.getDuration(CommonConnectorConfig.RETRIABLE_RESTART_WAIT, ChronoUnit.MILLIS);
-            snapshotMaxRestartAttempts = config.getInteger(CommonConnectorConfig.SNAPSHOT_MAX_RESTART_ATTEMPTS);
+            maxRetriableRestarts = config.getInteger(CommonConnectorConfig.RETRIABLE_RESTART_MAX_ATTEMPTS);
             // need to reset the delay or you only get one delayed restart
             restartDelay = null;
             if (!config.validateAndRecord(getAllConfigurationFields(), LOGGER::error)) {
@@ -155,39 +154,48 @@ public abstract class BaseSourceTask<P extends Partition, O extends OffsetContex
 
     @Override
     public final List<SourceRecord> poll() throws InterruptedException {
-        boolean started = startIfNeededAndPossible();
-
-        // in backoff period after a retriable exception
-        if (!started) {
-            // WorkerSourceTask calls us immediately after we return the empty list.
-            // This turns into a throttling so we need to make a pause before we return
-            // the control back.
-            Metronome.parker(Duration.of(2, ChronoUnit.SECONDS), Clock.SYSTEM).pause();
-            return Collections.emptyList();
-        }
-
+        // start() is inside the try because it is the likeliest thing to keep failing: while the source is
+        // unreachable every restart fails here rather than in doPoll(), and those restarts have to be counted too.
         try {
+            // in backoff period after a retriable exception
+            if (!startIfNeededAndPossible()) {
+                // WorkerSourceTask calls us immediately after we return the empty list.
+                // This turns into a throttling so we need to make a pause before we return
+                // the control back.
+                Metronome.parker(Duration.of(2, ChronoUnit.SECONDS), Clock.SYSTEM).pause();
+                return Collections.emptyList();
+            }
+
             final List<SourceRecord> records = doPoll();
             logStatistics(records);
+            clearRetriableRestartsIfWorking();
             return records;
         }
         catch (RetriableException e) {
-            // Read before stop(), which stops the coordinator this asks
-            final boolean snapshotUnfinished = coordinator != null && !coordinator.isSnapshotCompleted();
             stop(true);
 
-            if (!snapshotUnfinished) {
-                incompleteSnapshotRestarts = 0;
-                throw e;
-            }
-            if (snapshotMaxRestartAttempts >= 0 && ++incompleteSnapshotRestarts > snapshotMaxRestartAttempts) {
-                throw new ConnectException("Restarted " + incompleteSnapshotRestarts + " times after a retriable error "
-                        + "without the snapshot completing, more than "
-                        + CommonConnectorConfig.SNAPSHOT_MAX_RESTART_ATTEMPTS.name() + " allows ("
-                        + snapshotMaxRestartAttempts + "). Each restart re-reads the source from the first table, so "
-                        + "the connector is failing instead of restarting again.", e);
+            if (maxRetriableRestarts >= 0 && ++retriableRestarts > maxRetriableRestarts) {
+                throw new ConnectException("Restarted " + retriableRestarts + " times after a retriable error without "
+                        + "the connector working again in between, more than "
+                        + CommonConnectorConfig.RETRIABLE_RESTART_MAX_ATTEMPTS.name() + " allows ("
+                        + maxRetriableRestarts + "). Failing instead of restarting again.", e);
             }
             throw e;
+        }
+    }
+
+    /**
+     * A poll that returns rather than throwing means the connector started, its change event source recorded no
+     * failure and the queue drained - once the snapshot is complete, that is the connector working, whether or not
+     * the source had anything to say. An idle source is not a failing one.
+     * <p>
+     * While the snapshot is still running the same poll means nothing of the sort: a restart re-reads from the first
+     * table, so those polls would keep clearing the count and the connector would restart forever, which is the loop
+     * this limit exists to stop.
+     */
+    private void clearRetriableRestartsIfWorking() {
+        if (retriableRestarts > 0 && coordinator != null && coordinator.isSnapshotCompleted()) {
+            retriableRestarts = 0;
         }
     }
 
