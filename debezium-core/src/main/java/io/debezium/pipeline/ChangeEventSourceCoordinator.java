@@ -65,6 +65,10 @@ public class ChangeEventSourceCoordinator<P extends Partition, O extends OffsetC
     protected final DatabaseSchema<?> schema;
 
     private volatile boolean running;
+
+    /** Written on the change-event-source thread, read by the task thread. */
+    private volatile boolean snapshotCompleted;
+
     protected volatile StreamingChangeEventSource<P, O> streamingSource;
     protected final ReentrantLock commitOffsetLock = new ReentrantLock();
 
@@ -83,6 +87,16 @@ public class ChangeEventSourceCoordinator<P extends Partition, O extends OffsetC
         this.executor = Threads.newSingleThreadExecutor(connectorType, connectorConfig.getLogicalName(), "change-event-source-coordinator");
         this.eventDispatcher = eventDispatcher;
         this.schema = schema;
+    }
+
+    /**
+     * Whether this run's snapshot completed or was skipped. A restarted connector builds a new coordinator, so this
+     * starts out {@code false} again, and is true early on when a stored offset let the restart skip the snapshot.
+     * That is what tells a caller whether a successful poll means the connector is working or is only re-reading a
+     * table it will read again after the next restart.
+     */
+    public boolean isSnapshotCompleted() {
+        return snapshotCompleted;
     }
 
     public synchronized void start(CdcSourceTaskContext taskContext, ChangeEventQueueMetrics changeEventQueueMetrics,
@@ -154,6 +168,12 @@ public class ChangeEventSourceCoordinator<P extends Partition, O extends OffsetC
         eventDispatcher.setEventListener(snapshotMetrics);
         SnapshotResult<O> snapshotResult = snapshotSource.execute(context, partition, previousOffset);
         LOGGER.info("Snapshot ended with {}", snapshotResult);
+
+        // Set here rather than in executeChangeEventSources, which SqlServerChangeEventSourceCoordinator overrides.
+        // The error check is for MongoDB, which reports a snapshot completed even when a replica set failed.
+        if (snapshotResult.isCompletedOrSkipped() && errorHandler.getProducerThrowable() == null) {
+            snapshotCompleted = true;
+        }
 
         if (snapshotResult.getStatus() == SnapshotResultStatus.COMPLETED || schema.tableInformationComplete()) {
             schema.assureNonEmptySchema();
