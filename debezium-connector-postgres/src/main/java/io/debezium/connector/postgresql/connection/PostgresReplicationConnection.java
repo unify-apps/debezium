@@ -33,6 +33,7 @@ import org.postgresql.core.ServerVersion;
 import org.postgresql.replication.PGReplicationStream;
 import org.postgresql.replication.fluent.logical.ChainedLogicalStreamBuilder;
 import org.postgresql.util.PSQLException;
+import org.postgresql.util.PSQLState;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -56,6 +57,10 @@ import io.debezium.util.Metronome;
  * @author Horia Chiorean (hchiorea@redhat.com)
  */
 public class PostgresReplicationConnection extends JdbcConnection implements ReplicationConnection {
+
+    private static final String SQL_LOCK_NOT_AVAILABLE = "55P03";
+
+    private static final String PUBLICATION_QUERY_FAILURE_MESSAGE = "Creation of publication slot failed: query to create/update publication timed out, please make sure that there are no maintenance activities going on the database end.";
 
     private static Logger LOGGER = LoggerFactory.getLogger(PostgresReplicationConnection.class);
 
@@ -166,7 +171,18 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
                                     createPublicationStmt = String.format("CREATE PUBLICATION %s FOR ALL TABLES;", publicationName);
                                     LOGGER.info("Creating Publication with statement '{}'", createPublicationStmt);
                                     // Publication doesn't exist, create it.
-                                    stmt.execute(createPublicationStmt);
+                                    try {
+                                        stmt.setQueryTimeout(toIntExact(connectorConfig.createSlotCommandTimeout()));
+                                        stmt.execute(createPublicationStmt);
+                                    }
+                                    catch (SQLException ex) {
+                                        if (PSQLState.QUERY_CANCELED.getState().equals(ex.getSQLState()) || SQL_LOCK_NOT_AVAILABLE.equals(ex.getSQLState())) {
+                                            throw new DebeziumException(PUBLICATION_QUERY_FAILURE_MESSAGE, ex);
+                                        }
+                                        else {
+                                            throw ex;
+                                        }
+                                    }
                                     break;
                                 case FILTERED:
                                     createOrUpdatePublicationModeFilterted(tableFilterString, stmt, false);
@@ -208,7 +224,18 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
             createOrUpdatePublicationStmt = isUpdate ? String.format("ALTER PUBLICATION %s SET TABLE %s;", publicationName, tableFilterString)
                     : String.format("CREATE PUBLICATION %s FOR TABLE %s;", publicationName, tableFilterString);
             LOGGER.info(isUpdate ? "Updating Publication with statement '{}'" : "Creating Publication with statement '{}'", createOrUpdatePublicationStmt);
-            stmt.execute(createOrUpdatePublicationStmt);
+            try {
+                stmt.setQueryTimeout(toIntExact(connectorConfig.createSlotCommandTimeout()));
+                stmt.execute(createOrUpdatePublicationStmt);
+            }
+            catch (SQLException ex) {
+                if (PSQLState.QUERY_CANCELED.getState().equals(ex.getSQLState()) || SQL_LOCK_NOT_AVAILABLE.equals(ex.getSQLState())) {
+                    throw new DebeziumException(PUBLICATION_QUERY_FAILURE_MESSAGE, ex);
+                }
+                else {
+                    throw ex;
+                }
+            }
         }
         catch (Exception e) {
             throw new ConnectException(String.format("Unable to %s filtered publication %s for %s", isUpdate ? "update" : "create", publicationName, tableFilterString),
@@ -385,13 +412,48 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
         initPublication();
 
         try (Statement stmt = pgConnection().createStatement()) {
+            stmt.setQueryTimeout(toIntExact(connectorConfig.createSlotCommandTimeout()));
             String createCommand = String.format(
                     "CREATE_REPLICATION_SLOT \"%s\" %s LOGICAL %s",
                     slotName,
                     tempPart,
                     plugin.getPostgresPluginName());
             LOGGER.info("Creating replication slot with command {}", createCommand);
-            stmt.execute(createCommand);
+
+            final int maxRetries = connectorConfig.maxRetries();
+            final Duration delay = connectorConfig.retryDelay();
+            int tryCount = 0;
+            while (true) {
+                try {
+                    stmt.execute(createCommand);
+                    break;
+                }
+                catch (SQLException ex) {
+                    // intercept the statement timeout error (due to query_canceled or lock_not_available) and retry
+                    // ref: https://www.postgresql.org/docs/current/errcodes-appendix.html
+                    if ("57014".equals(ex.getSQLState()) || "55P03".equals(ex.getSQLState())) {
+                        String message = "Creation of replication slot failed; " +
+                                "query to create replication slot timed out, please make sure that there are no long running queries on the database.";
+                        if (++tryCount > maxRetries) {
+                            throw new DebeziumException(message, ex);
+                        }
+                        else {
+                            LOGGER.warn("{} Waiting for {} and retrying, attempt number {} over {}", message, delay, tryCount, maxRetries, ex);
+                            final Metronome metronome = Metronome.parker(delay, Clock.SYSTEM);
+                            try {
+                                metronome.pause();
+                            }
+                            catch (InterruptedException e) {
+                                LOGGER.warn("Slot creation retry sleep interrupted by exception: {}", e.getMessage());
+                                Thread.currentThread().interrupt();
+                            }
+                        }
+                    }
+                    else {
+                        throw ex;
+                    }
+                }
+            }
             // when we are in Postgres 9.4+, we can parse the slot creation info,
             // otherwise, it returns nothing
             if (canExportSnapshot) {
