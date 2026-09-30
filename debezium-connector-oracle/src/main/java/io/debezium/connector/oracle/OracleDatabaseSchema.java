@@ -127,7 +127,13 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
      *         captured by this connector and was therefore not stored
      */
     public boolean registerTableObjectId(TableId tableId, Long objectId, Long dataObjectId) {
-        if (tableId == null || objectId == null || !isCapturedTable(tableId)) {
+        if (tableId == null || objectId == null) {
+            return false;
+        }
+        if (!isCapturedTable(tableId)) {
+            // Object ids are unique, so naming this one outside the capture set means any mapping it
+            // still has - a rename out of the capture set leaves one - no longer describes it.
+            objectIdToTableId.remove(objectId);
             return false;
         }
         objectIdToTableId.put(objectId, new TableObjectId(tableId, dataObjectId));

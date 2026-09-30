@@ -441,6 +441,17 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
         }
     }
 
+    /** F5: a rename out of the capture set must not leave the object id pointing at the old table. */
+    @Test
+    public void testRenameOutOfTheCaptureSetDropsTheMapping() {
+        assertThat(schema.registerTableObjectId(CAPTURED_TABLE, PURGED_OBJECT_ID, null)).isTrue();
+
+        // The rename DDL re-registers the same object id under a name outside the capture set.
+        assertThat(schema.registerTableObjectId(TableId.parse("ORCLPDB1.DEBEZIUM.OTHER_T"), PURGED_OBJECT_ID, null)).isFalse();
+
+        assertThat(schema.getTableIdByObjectId(PURGED_OBJECT_ID, null)).isNull();
+    }
+
     /** The schema and the processor must agree on the capture set; production never has them differ. */
     private Configuration.Builder getCapturedConfig() {
         return getConfig().with(OracleConnectorConfig.TABLE_INCLUDE_LIST, CAPTURE_SET);
