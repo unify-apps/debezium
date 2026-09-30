@@ -31,6 +31,7 @@ import io.debezium.connector.oracle.CommitScn;
 import io.debezium.connector.oracle.OracleConnection;
 import io.debezium.connector.oracle.OracleConnectorConfig;
 import io.debezium.connector.oracle.OracleDatabaseSchema;
+import io.debezium.connector.oracle.OracleDatabaseSchema.ObjectIdSkipReason;
 import io.debezium.connector.oracle.OracleDefaultValueConverter;
 import io.debezium.connector.oracle.OracleOffsetContext;
 import io.debezium.connector.oracle.OraclePartition;
@@ -63,6 +64,8 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
 
     private static final String TRANSACTION_ID_1 = "1234567890";
     private static final String TRANSACTION_ID_2 = "9876543210";
+
+    private static final long PURGED_OBJECT_ID = 162002L;
 
     @Rule
     public TestRule skipRule = new SkipTestDependingOnAdapterNameRule();
@@ -271,8 +274,126 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
         }
     }
 
+    @Test
+    public void testUnresolvableObjectIdIsSkippedUnderHybridStrategy() throws Exception {
+        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig().build());
+        try (T processor = getProcessor(config)) {
+            schema.registerSkippedObjectId(PURGED_OBJECT_ID, ObjectIdSkipReason.UNRESOLVABLE);
+            final int warningsBefore = metrics.getWarningCount();
+
+            processor.handleDataEvent(getPurgedObjectLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1));
+
+            assertThat(processor.getTransactionCache().isEmpty()).isTrue();
+            assertThat(metrics.getWarningCount()).isGreaterThan(warningsBefore);
+        }
+    }
+
+    @Test
+    public void testRegisteredObjectIdStillResolvesUnderHybridStrategy() throws Exception {
+        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig().build());
+        try (T processor = getProcessor(config)) {
+            schema.registerTableObjectId(TableId.parse("ORCLPDB1.DEBEZIUM.TEST_TABLE"), PURGED_OBJECT_ID, null);
+
+            processor.handleDataEvent(getPurgedObjectLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1));
+
+            assertThat(processor.getTransactionCache().isEmpty()).isFalse();
+        }
+    }
+
+    @Test
+    public void testNotCapturedObjectIdIsSkippedWithoutWarning() throws Exception {
+        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig().build());
+        try (T processor = getProcessor(config)) {
+            schema.registerSkippedObjectId(PURGED_OBJECT_ID, ObjectIdSkipReason.NOT_CAPTURED);
+            final int warningsBefore = metrics.getWarningCount();
+
+            processor.handleDataEvent(getPurgedObjectLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1));
+
+            assertThat(processor.getTransactionCache().isEmpty()).isTrue();
+            assertThat(metrics.getWarningCount()).isEqualTo(warningsBefore);
+        }
+    }
+
+    @Test
+    public void testRegistryRejectsTableOutsideTheCaptureSet() {
+        final TableId foreign = TableId.parse("ORCLPDB1.SOMEONE_ELSE.FOREIGN_TABLE");
+
+        assertThat(schema.isCapturedTable(foreign)).isFalse();
+        assertThat(schema.registerTableObjectId(foreign, PURGED_OBJECT_ID, null)).isFalse();
+        assertThat(schema.getTableIdByObjectId(PURGED_OBJECT_ID, null)).isNull();
+    }
+
+    @Test
+    public void testRegistryAcceptsCapturedTable() {
+        final TableId captured = TableId.parse("ORCLPDB1.DEBEZIUM.TEST_TABLE");
+
+        assertThat(schema.isCapturedTable(captured)).isTrue();
+        assertThat(schema.registerTableObjectId(captured, PURGED_OBJECT_ID, null)).isTrue();
+        assertThat(schema.getTableIdByObjectId(PURGED_OBJECT_ID, null)).isEqualTo(captured);
+    }
+
+    @Test
+    public void testRegisteringTableObjectIdClearsAPriorSkipDecision() {
+        schema.registerSkippedObjectId(PURGED_OBJECT_ID, ObjectIdSkipReason.UNRESOLVABLE);
+        assertThat(schema.getObjectIdSkipReason(PURGED_OBJECT_ID)).isEqualTo(ObjectIdSkipReason.UNRESOLVABLE);
+
+        assertThat(schema.registerTableObjectId(TableId.parse("ORCLPDB1.DEBEZIUM.TEST_TABLE"), PURGED_OBJECT_ID, null)).isTrue();
+
+        assertThat(schema.getObjectIdSkipReason(PURGED_OBJECT_ID)).isNull();
+    }
+
+    @Test
+    public void testSkippedObjectIdCacheIsBounded() throws Exception {
+        final int cacheSize = new OracleConnectorConfig(getConfig().build()).getLogMiningObjectIdCacheSize();
+        for (long objectId = 1L; objectId <= cacheSize + 10L; objectId++) {
+            schema.registerSkippedObjectId(objectId, ObjectIdSkipReason.NOT_CAPTURED);
+        }
+
+        assertThat(schema.getObjectIdSkipReason(1L)).isNull();
+        assertThat(schema.getObjectIdSkipReason(cacheSize + 10L)).isEqualTo(ObjectIdSkipReason.NOT_CAPTURED);
+    }
+
+    /**
+     * The production failure: a dropped and purged object reaches the processor, the registry misses
+     * and the live {@code ALL_OBJECTS} lookup answers nothing. Nothing is seeded here, so this covers
+     * the first encounter - the path that used to throw and stop the connector for good.
+     */
+    /** The production failure: a dropped and purged object reached the processor and stopped it. */
+    @Test
+    public void testUnresolvableObjectIdIsSkippedOnFirstEncounter() throws Exception {
+        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig().build());
+        try (T processor = getProcessor(config)) {
+            assertThat(schema.getObjectIdSkipReason(PURGED_OBJECT_ID)).isNull();
+            final int warningsBefore = metrics.getWarningCount();
+
+            processor.handleDataEvent(getPurgedObjectLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1));
+
+            assertThat(processor.getTransactionCache().isEmpty()).isTrue();
+            assertThat(metrics.getWarningCount()).isGreaterThan(warningsBefore);
+            assertThat(schema.getObjectIdSkipReason(PURGED_OBJECT_ID)).isEqualTo(ObjectIdSkipReason.UNRESOLVABLE);
+        }
+    }
+
+    @Test
+    public void testRecycleBinMissFallsBackToObjectIdResolution() throws Exception {
+        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig().build());
+        try (T processor = getProcessor(config)) {
+            assertThat(schema.registerTableObjectId(TableId.parse("ORCLPDB1.DEBEZIUM.TEST_TABLE"), PURGED_OBJECT_ID, null)).isTrue();
+
+            processor.handleDataEvent(getRecycleBinLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1));
+
+            assertThat(processor.getTransactionCache().isEmpty()).isFalse();
+        }
+    }
+
+    private Configuration.Builder getHybridConfig() {
+        return getConfig().with(OracleConnectorConfig.LOG_MINING_STRATEGY, "hybrid");
+    }
+
+    /** An explicit capture set: the default configuration includes every table, so nothing is outside it. */
     private OracleDatabaseSchema createOracleDatabaseSchema() throws Exception {
-        final OracleConnectorConfig connectorConfig = new OracleConnectorConfig(getConfig().build());
+        final OracleConnectorConfig connectorConfig = new OracleConnectorConfig(
+                getConfig().with(OracleConnectorConfig.TABLE_INCLUDE_LIST, "DEBEZIUM\\.TEST_TABLE").build());
         final TopicSelector<TableId> topicSelector = OracleTopicSelector.defaultSelector(connectorConfig);
         final SchemaNameAdjuster schemaNameAdjuster = connectorConfig.schemaNameAdjustmentMode().createAdjuster();
         final OracleValueConverters converters = new OracleValueConverters(connectorConfig, connection);
@@ -375,6 +496,24 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
         Mockito.when(row.getRsId()).thenReturn("A.B.C");
         Mockito.when(row.getTablespaceName()).thenReturn("DEBEZIUM");
         Mockito.when(row.getUserName()).thenReturn(TestHelper.SCHEMA_USER);
+        return row;
+    }
+
+    private LogMinerEventRow getRecycleBinLogMinerEventRow(Scn scn, String transactionId) {
+        final String recycleBinName = "BIN$aBcDeFgHiJkLmNoPqRsTuV==$0";
+        LogMinerEventRow row = getInsertLogMinerEventRow(scn, transactionId, Instant.now());
+        Mockito.when(row.getTableName()).thenReturn(recycleBinName);
+        Mockito.when(row.getTableId()).thenReturn(new TableId("ORCLPDB1", "DEBEZIUM", recycleBinName));
+        Mockito.when(row.getObjectId()).thenReturn(PURGED_OBJECT_ID);
+        return row;
+    }
+
+    private LogMinerEventRow getPurgedObjectLogMinerEventRow(Scn scn, String transactionId) {
+        LogMinerEventRow row = getInsertLogMinerEventRow(scn, transactionId, Instant.now());
+        Mockito.when(row.getTableName()).thenReturn("OBJ# " + PURGED_OBJECT_ID);
+        Mockito.when(row.getTableId()).thenReturn(new TableId("ORCLPDB1", "UNKNOWN", "OBJ# " + PURGED_OBJECT_ID));
+        Mockito.when(row.getTablespaceName()).thenReturn("UNKNOWN");
+        Mockito.when(row.getObjectId()).thenReturn(PURGED_OBJECT_ID);
         return row;
     }
 

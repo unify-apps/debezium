@@ -57,15 +57,20 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
      * {@code ALL_OBJECTS} for all captured tables when streaming starts, updated as DDL events are
      * observed, and consulted on demand. Entries are intentionally never removed on DROP so trailing
      * DML events that precede the drop in the redo stream still resolve.
+     * <p>
+     * Unbounded, and only safe as such because registration rejects anything outside the capture set;
+     * a miss therefore means "not a captured table", which is what the event processor relies on.
      */
     private final ConcurrentMap<Long, TableObjectId> objectIdToTableId = new ConcurrentHashMap<>();
 
     /**
-     * Bounded negative-lookup cache of object ids known to be unresolvable, preventing repeated
-     * database lookups for the same unknown object id (upstream DBZ-8399 semantics). Bounded by
-     * {@code internal.log.mining.object.id.cache.size} (upstream DBZ-8071).
+     * Object ids not worth looking up again: unresolvable, or resolved outside the capture set
+     * (upstream DBZ-8399, extended to the second case). Caching the decision rather than the table id
+     * is what keeps this bounded by {@code internal.log.mining.object.id.cache.size}.
      */
-    private final Map<Long, Boolean> unresolvableObjectIds;
+    private final Map<Long, ObjectIdSkipReason> skippedObjectIds;
+
+    private final Tables.TableFilter capturedTableFilter;
 
     private boolean storageInitializationExecuted = false;
 
@@ -93,10 +98,12 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
                 valueConverters,
                 connectorConfig.getTableFilters().dataCollectionFilter());
 
+        this.capturedTableFilter = connectorConfig.getTableFilters().dataCollectionFilter();
+
         final int objectIdCacheSize = connectorConfig.getLogMiningObjectIdCacheSize();
-        this.unresolvableObjectIds = Collections.synchronizedMap(new LinkedHashMap<Long, Boolean>(16, 0.75f, true) {
+        this.skippedObjectIds = Collections.synchronizedMap(new LinkedHashMap<Long, ObjectIdSkipReason>(16, 0.75f, true) {
             @Override
-            protected boolean removeEldestEntry(Map.Entry<Long, Boolean> eldest) {
+            protected boolean removeEldestEntry(Map.Entry<Long, ObjectIdSkipReason> eldest) {
                 return size() > objectIdCacheSize;
             }
         });
@@ -104,17 +111,35 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
 
     /**
      * Registers the Oracle object identifiers for a captured table.
+     * <p>
+     * A table outside the capture set is rejected rather than stored, keeping the unbounded registry
+     * sized by the capture set.
      *
      * @param tableId the relational table identifier, ignored if {@code null}
      * @param objectId the table's {@code OBJECT_ID}, ignored if {@code null}
      * @param dataObjectId the table's {@code DATA_OBJECT_ID}; may be {@code null} when unknown, in
      *            which case the entry matches lookups regardless of the requested data object id
+     * @return {@code true} if the identifiers were registered, {@code false} if the table is not
+     *         captured by this connector and was therefore not stored
      */
-    public void registerTableObjectId(TableId tableId, Long objectId, Long dataObjectId) {
-        if (tableId != null && objectId != null) {
-            objectIdToTableId.put(objectId, new TableObjectId(tableId, dataObjectId));
-            unresolvableObjectIds.remove(objectId);
+    public boolean registerTableObjectId(TableId tableId, Long objectId, Long dataObjectId) {
+        if (tableId == null || objectId == null) {
+            return false;
         }
+        if (!isCapturedTable(tableId)) {
+            return false;
+        }
+        objectIdToTableId.put(objectId, new TableObjectId(tableId, dataObjectId));
+        skippedObjectIds.remove(objectId);
+        return true;
+    }
+
+    /**
+     * @param tableId the table identifier, may be {@code null}
+     * @return {@code true} when the table is in the relational model or matches the include/exclude lists
+     */
+    public boolean isCapturedTable(TableId tableId) {
+        return tableId != null && (tableFor(tableId) != null || capturedTableFilter.isIncluded(tableId));
     }
 
     /**
@@ -137,19 +162,35 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
     }
 
     /**
-     * Returns whether a prior lookup already failed to resolve the given object id.
+     * Reads through the access-ordered cache, so a hit refreshes the entry's recency.
+     *
+     * @param objectId the object id to look up, may be {@code null}
+     * @return the recorded reason, or {@code null} if this object id has not been decided
      */
-    public boolean isObjectIdUnresolvable(Long objectId) {
-        return objectId != null && unresolvableObjectIds.containsKey(objectId);
+    public ObjectIdSkipReason getObjectIdSkipReason(Long objectId) {
+        return objectId == null ? null : skippedObjectIds.get(objectId);
     }
 
     /**
-     * Records that the given object id could not be resolved, so subsequent lookups fail fast.
+     * Records that events for the given object id must be skipped.
+     *
+     * @param objectId the object id, ignored if {@code null}
+     * @param reason why events for it are skipped, must not be {@code null}
      */
-    public void registerUnresolvableObjectId(Long objectId) {
+    public void registerSkippedObjectId(Long objectId, ObjectIdSkipReason reason) {
+        Objects.requireNonNull(reason, "A skip reason must be provided");
         if (objectId != null) {
-            unresolvableObjectIds.put(objectId, Boolean.TRUE);
+            skippedObjectIds.put(objectId, reason);
         }
+    }
+
+    /** Distinguished only so that a routine skip does not log like a diagnosable one. */
+    public enum ObjectIdSkipReason {
+        /** Resolved to a table outside the capture set. */
+        NOT_CAPTURED,
+
+        /** Absent from both the registry and {@code ALL_OBJECTS}, so dropped and purged. */
+        UNRESOLVABLE
     }
 
     private static final class TableObjectId {

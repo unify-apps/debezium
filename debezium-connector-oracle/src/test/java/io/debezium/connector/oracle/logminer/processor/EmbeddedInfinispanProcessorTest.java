@@ -11,6 +11,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.config.Configuration;
+import io.debezium.connector.oracle.OracleConnection;
 import io.debezium.connector.oracle.OracleConnectorConfig;
 import io.debezium.connector.oracle.OracleConnectorConfig.LogMiningBufferType;
 import io.debezium.connector.oracle.junit.SkipWhenAdapterNameIsNot;
@@ -50,6 +51,12 @@ public class EmbeddedInfinispanProcessorTest extends AbstractProcessorUnitTest<A
                 partition,
                 offsetContext,
                 schema,
-                metrics);
+                metrics) {
+            // Unstubbed lookups on the mock answer null: the dropped-and-purged case.
+            @Override
+            protected OracleConnection createOutOfBandsConnection() {
+                return connection;
+            }
+        };
     }
 }

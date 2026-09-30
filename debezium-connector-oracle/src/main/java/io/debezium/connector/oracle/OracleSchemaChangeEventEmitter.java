@@ -208,9 +208,8 @@ public class OracleSchemaChangeEventEmitter implements SchemaChangeEventEmitter 
     private void registerTableObjectIds(TableId tableId) {
         if (objectId != null && connectorConfig.getAdapter() instanceof LogMinerAdapter) {
             if (OracleConnectorConfig.LogMiningStrategy.HYBRID.equals(connectorConfig.getLogMiningStrategy())) {
-                if (schema.tableFor(tableId) != null || filters.isIncluded(tableId)) {
-                    schema.registerTableObjectId(tableId, objectId, dataObjectId);
-                }
+                // The registry applies the capture-set test itself.
+                schema.registerTableObjectId(tableId, objectId, dataObjectId);
             }
         }
     }
