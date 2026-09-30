@@ -702,8 +702,11 @@ public class OracleConnection extends JdbcConnection {
      * @throws SQLException if a database exception occurred
      */
     public TableId resolveTableIdByObjectId(Long objectId, String catalogName) throws SQLException {
+        // Partitions are admitted because a partitioned table has no table-level data object, so DML on
+        // one carries the partition's object id. Their OBJECT_NAME is the table's, so the identifier
+        // resolves to the table either way.
         return prepareQueryAndMap(
-                "SELECT OWNER, OBJECT_NAME FROM ALL_OBJECTS WHERE OBJECT_TYPE='TABLE' AND OBJECT_ID=?",
+                "SELECT OWNER, OBJECT_NAME FROM ALL_OBJECTS WHERE OBJECT_TYPE IN ('TABLE','TABLE PARTITION','TABLE SUBPARTITION') AND OBJECT_ID=?",
                 ps -> ps.setLong(1, objectId),
                 rs -> rs.next() ? new TableId(catalogName, rs.getString(1), rs.getString(2)) : null);
     }
