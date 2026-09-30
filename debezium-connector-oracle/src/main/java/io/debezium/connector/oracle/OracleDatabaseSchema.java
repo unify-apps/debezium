@@ -12,6 +12,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
@@ -70,7 +71,12 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
      */
     private final Map<Long, ObjectIdSkipReason> skippedObjectIds;
 
-    private final Tables.TableFilter capturedTableFilter;
+    /**
+     * Captured tables with no registered object id, so the registry cannot be treated as covering the
+     * whole capture set. Only populated when a captured table is absent from {@code ALL_OBJECTS} at
+     * streaming start, which a drop-and-purge before the connector caught up produces.
+     */
+    private final Set<TableId> capturedTablesWithoutObjectId = ConcurrentHashMap.newKeySet();
 
     private boolean storageInitializationExecuted = false;
 
@@ -98,8 +104,6 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
                 valueConverters,
                 connectorConfig.getTableFilters().dataCollectionFilter());
 
-        this.capturedTableFilter = connectorConfig.getTableFilters().dataCollectionFilter();
-
         final int objectIdCacheSize = connectorConfig.getLogMiningObjectIdCacheSize();
         this.skippedObjectIds = Collections.synchronizedMap(new LinkedHashMap<Long, ObjectIdSkipReason>(16, 0.75f, true) {
             @Override
@@ -123,23 +127,48 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
      *         captured by this connector and was therefore not stored
      */
     public boolean registerTableObjectId(TableId tableId, Long objectId, Long dataObjectId) {
-        if (tableId == null || objectId == null) {
-            return false;
-        }
-        if (!isCapturedTable(tableId)) {
+        if (tableId == null || objectId == null || !isCapturedTable(tableId)) {
             return false;
         }
         objectIdToTableId.put(objectId, new TableObjectId(tableId, dataObjectId));
         skippedObjectIds.remove(objectId);
+        capturedTablesWithoutObjectId.remove(tableId);
         return true;
     }
 
     /**
+     * Records that a captured table has no resolvable object id, so an unresolvable event can no
+     * longer be presumed to belong to another connector's tables.
+     *
+     * @param tableId the captured table, ignored if {@code null}
+     */
+    public void registerCapturedTableWithoutObjectId(TableId tableId) {
+        if (tableId != null) {
+            capturedTablesWithoutObjectId.add(tableId);
+        }
+    }
+
+    /**
+     * @return {@code true} when every captured table has a registered object id, which is what makes
+     *         a registry miss proof that the object is not captured
+     */
+    public boolean isObjectIdRegistryComplete() {
+        return capturedTablesWithoutObjectId.isEmpty();
+    }
+
+    /**
+     * @return the captured tables with no registered object id, for diagnostics
+     */
+    public Set<TableId> getCapturedTablesWithoutObjectId() {
+        return Collections.unmodifiableSet(capturedTablesWithoutObjectId);
+    }
+
+    /**
      * @param tableId the table identifier, may be {@code null}
-     * @return {@code true} when the table is in the relational model or matches the include/exclude lists
+     * @return {@code true} when the table matches the configured include/exclude lists
      */
     public boolean isCapturedTable(TableId tableId) {
-        return tableId != null && (tableFor(tableId) != null || capturedTableFilter.isIncluded(tableId));
+        return tableId != null && getTableFilter().isIncluded(tableId);
     }
 
     /**
