@@ -669,6 +669,26 @@ public class OracleConnection extends JdbcConnection {
     }
 
     /**
+     * Get the names of the partitioned tables owned by the given schema.
+     *
+     * @param owner the schema name, should not be {@code null}
+     * @return the partitioned table names, never {@code null}
+     * @throws SQLException if a database exception occurred
+     */
+    public Set<String> getPartitionedTableNames(String owner) throws SQLException {
+        return prepareQueryAndMap(
+                "SELECT TABLE_NAME FROM ALL_TABLES WHERE OWNER=? AND PARTITIONED='YES'",
+                ps -> ps.setString(1, owner),
+                rs -> {
+                    final Set<String> names = new HashSet<>();
+                    while (rs.next()) {
+                        names.add(rs.getString(1));
+                    }
+                    return names;
+                });
+    }
+
+    /**
      * Get the table's Oracle {@code DATA_OBJECT_ID} from {@code ALL_OBJECTS}.
      *
      * @param tableId the table identifier, should not be {@code null}

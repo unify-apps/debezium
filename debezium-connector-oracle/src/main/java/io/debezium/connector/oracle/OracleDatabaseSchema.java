@@ -12,7 +12,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
@@ -59,8 +58,9 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
      * observed, and consulted on demand. Entries are intentionally never removed on DROP so trailing
      * DML events that precede the drop in the redo stream still resolve.
      * <p>
-     * Unbounded, and only safe as such because registration rejects anything outside the capture set;
-     * a miss therefore means "not a captured table", which is what the event processor relies on.
+     * Unbounded, and only safe as such because registration rejects anything outside the capture set,
+     * which bounds it by the capture set's tables and their partitions. A miss is not evidence that the
+     * object is foreign: ids destroyed while the connector was not reading can never be registered.
      */
     private final ConcurrentMap<Long, TableObjectId> objectIdToTableId = new ConcurrentHashMap<>();
 
@@ -70,13 +70,6 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
      * is what keeps this bounded by {@code internal.log.mining.object.id.cache.size}.
      */
     private final Map<Long, ObjectIdSkipReason> skippedObjectIds;
-
-    /**
-     * Captured tables with no registered object id, so the registry cannot be treated as covering the
-     * whole capture set. Only populated when a captured table is absent from {@code ALL_OBJECTS} at
-     * streaming start, which a drop-and-purge before the connector caught up produces.
-     */
-    private final Set<TableId> capturedTablesWithoutObjectId = ConcurrentHashMap.newKeySet();
 
     private boolean storageInitializationExecuted = false;
 
@@ -138,35 +131,7 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
         }
         objectIdToTableId.put(objectId, new TableObjectId(tableId, dataObjectId));
         skippedObjectIds.remove(objectId);
-        capturedTablesWithoutObjectId.remove(tableId);
         return true;
-    }
-
-    /**
-     * Records that a captured table has no resolvable object id, so an unresolvable event can no
-     * longer be presumed to belong to another connector's tables.
-     *
-     * @param tableId the captured table, ignored if {@code null}
-     */
-    public void registerCapturedTableWithoutObjectId(TableId tableId) {
-        if (tableId != null) {
-            capturedTablesWithoutObjectId.add(tableId);
-        }
-    }
-
-    /**
-     * @return {@code true} when every captured table has a registered object id, which is what makes
-     *         a registry miss proof that the object is not captured
-     */
-    public boolean isObjectIdRegistryComplete() {
-        return capturedTablesWithoutObjectId.isEmpty();
-    }
-
-    /**
-     * @return the captured tables with no registered object id, for diagnostics
-     */
-    public Set<TableId> getCapturedTablesWithoutObjectId() {
-        return Collections.unmodifiableSet(capturedTablesWithoutObjectId);
     }
 
     /**
@@ -211,12 +176,15 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
      *
      * @param objectId the object id, ignored if {@code null}
      * @param reason why events for it are skipped, must not be {@code null}
+     * @return {@code true} when this reason was not already recorded for the object id, which callers
+     *         use to report a decision once rather than once per event
      */
-    public void registerSkippedObjectId(Long objectId, ObjectIdSkipReason reason) {
+    public boolean registerSkippedObjectId(Long objectId, ObjectIdSkipReason reason) {
         Objects.requireNonNull(reason, "A skip reason must be provided");
-        if (objectId != null) {
-            skippedObjectIds.put(objectId, reason);
+        if (objectId == null) {
+            return false;
         }
+        return skippedObjectIds.put(objectId, reason) != reason;
     }
 
     /** Distinguished only so that a routine skip does not log like a diagnosable one. */

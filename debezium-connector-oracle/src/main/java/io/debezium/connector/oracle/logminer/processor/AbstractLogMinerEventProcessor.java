@@ -13,10 +13,12 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.regex.Matcher;
@@ -100,6 +102,10 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
     private Scn currentOffsetScn = Scn.NULL;
     private Map<Integer, Scn> currentOffsetCommitScns = new HashMap<>();
     private Scn lastProcessedScn = Scn.NULL;
+
+    /** Discarded in the current mining batch because their object id named no table; reported per batch. */
+    private final Set<Long> unresolvableSkippedObjectIds = new HashSet<>();
+    private long unresolvableSkippedEvents;
     private boolean sequenceUnavailable = false;
 
     public AbstractLogMinerEventProcessor(ChangeEventSourceContext context,
@@ -275,6 +281,21 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
         while (context.isRunning() && hasNextWithMetricsUpdate(resultSet)) {
             counters.rows++;
             processRow(partition, LogMinerEventRow.fromResultSet(resultSet, getConfig().getCatalogName(), isTrxIdRawValue()));
+        }
+        reportUnresolvableObjectIdSkips();
+    }
+
+    /**
+     * Reports how much this batch discarded for object ids that named no table. The per-id warning says
+     * which object, this says how many events went with it, which is the number that matters when
+     * {@code log.mining.unresolvable.object.id.handling.mode} is set to skip.
+     */
+    private void reportUnresolvableObjectIdSkips() {
+        if (unresolvableSkippedEvents > 0) {
+            LOGGER.warn("Skipped {} change events across {} unresolvable object ids in this mining batch.",
+                    unresolvableSkippedEvents, unresolvableSkippedObjectIds.size());
+            unresolvableSkippedEvents = 0;
+            unresolvableSkippedObjectIds.clear();
         }
     }
 
@@ -890,138 +911,130 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
      */
     private TableId getTableIdForDataEvent(LogMinerEventRow row) throws SQLException {
         final TableId tableId = row.getTableId();
-        if (tableId == null || !isUsingHybridStrategy()) {
-            return tableId;
-        }
-        final boolean recycled = tableId.table().startsWith(RECYCLEBIN_TABLE_PREFIX);
-        if (!recycled && !tableId.table().startsWith(UNKNOWN_TABLE_PREFIX) && !UNKNOWN_TABLE_NAME.equalsIgnoreCase(tableId.table())) {
-            return tableId;
-        }
-
-        // The object id survives both a recycle-bin rename and a purge, so the caches answer first and
-        // keep a burst on one object off the database entirely.
-        final Long objectId = row.getObjectId() != 0 ? row.getObjectId() : null;
-        final Long dataObjectId = row.getDataObjectId() != 0 ? row.getDataObjectId() : null;
-        if (objectId != null) {
-            final TableId registered = getSchema().getTableIdByObjectId(objectId, dataObjectId);
-            if (registered != null) {
-                return registered;
+        if (tableId != null && isUsingHybridStrategy()) {
+            if (tableId.table().startsWith(RECYCLEBIN_TABLE_PREFIX)) {
+                // Object was dropped but has not been purged; resolve the original name from the recycle bin.
+                try (OracleConnection connection = createOutOfBandsConnection()) {
+                    return connection.prepareQueryAndMap("SELECT OWNER, ORIGINAL_NAME FROM DBA_RECYCLEBIN WHERE OBJECT_NAME=?",
+                            ps -> ps.setString(1, tableId.table()),
+                            rs -> {
+                                if (rs.next()) {
+                                    return new TableId(tableId.catalog(), rs.getString(1), rs.getString(2));
+                                }
+                                return tableId;
+                            });
+                }
             }
-            if (getSchema().getObjectIdSkipReason(objectId) != null) {
-                LOGGER.debug("Object id {} was already decided as skippable. The event '{}' will be skipped.", objectId, row);
-                return null;
+            else if (tableId.table().startsWith(UNKNOWN_TABLE_PREFIX) || UNKNOWN_TABLE_NAME.equalsIgnoreCase(tableId.table())) {
+                // Object has been dropped and purged; the only option is to resolve the table by object id.
+                return resolveTableIdByObjectId(row);
             }
         }
-
-        if (recycled) {
-            final TableId original;
-            try (OracleConnection connection = createOutOfBandsConnection()) {
-                original = connection.prepareQueryAndMap("SELECT OWNER, ORIGINAL_NAME FROM DBA_RECYCLEBIN WHERE OBJECT_NAME=?",
-                        ps -> ps.setString(1, tableId.table()),
-                        rs -> {
-                            if (rs.next()) {
-                                return new TableId(tableId.catalog(), rs.getString(1), rs.getString(2));
-                            }
-                            return null;
-                        });
-            }
-            if (original != null) {
-                return original;
-            }
-            // Returning the BIN$ identifier would leave the event unmatchable by the capture-set filter
-            // and dropped without a trace.
-        }
-        return lookupAndClassifyObjectId(row, objectId, dataObjectId);
+        return tableId;
     }
 
     /**
-     * Resolves an object id that neither cache answered, through a live {@code ALL_OBJECTS} lookup,
-     * and classifies the outcome (upstream DBZ-8399, extended to cover resolvable objects outside the
-     * capture set).
+     * Resolves a table identifier from the event row's object id: the registry first, then a decision
+     * already taken for that id, then a live {@code ALL_OBJECTS} lookup (upstream DBZ-8399 semantics).
+     * <p>
+     * The two outcomes are not equally informative. An id that resolves to an existing table outside
+     * the capture set is proven to be someone else's and is skipped. An id that resolves to nothing
+     * proves nothing - a purged object keeps no owner or name - and is left to the operator's
+     * configuration.
      *
      * @param row the result set row, should not be {@code null}
-     * @param objectId the event's object id, {@code null} when the row carries none
-     * @param dataObjectId the event's data object id, may be {@code null}
      * @return the resolved table identifier, or {@code null} if the event should be skipped
      * @throws SQLException if a database exception occurred
      */
-    private TableId lookupAndClassifyObjectId(LogMinerEventRow row, Long objectId, Long dataObjectId) throws SQLException {
+    private TableId resolveTableIdByObjectId(LogMinerEventRow row) throws SQLException {
+        final Long objectId = row.getObjectId() != 0 ? row.getObjectId() : null;
+        final Long dataObjectId = row.getDataObjectId() != 0 ? row.getDataObjectId() : null;
         if (objectId == null) {
-            // Nothing identifies the event, which is the corrupt-event case the failure mode exists for.
-            return notifyUnidentifiableObject(row, null);
+            return handleUnresolvableObjectId(row, null);
         }
 
-        try (OracleConnection connection = createOutOfBandsConnection()) {
-            final TableId resolved = connection.resolveTableIdByObjectId(objectId, row.getTableId().catalog());
-            if (resolved != null) {
-                if (getSchema().registerTableObjectId(resolved, objectId, dataObjectId)) {
-                    return resolved;
+        final TableId registered = getSchema().getTableIdByObjectId(objectId, dataObjectId);
+        if (registered != null) {
+            return registered;
+        }
+
+        final ObjectIdSkipReason decided = getSchema().getObjectIdSkipReason(objectId);
+        if (ObjectIdSkipReason.NOT_CAPTURED.equals(decided)) {
+            return skipForeignObjectId(objectId);
+        }
+        if (decided == null) {
+            try (OracleConnection connection = createOutOfBandsConnection()) {
+                final TableId resolved = connection.resolveTableIdByObjectId(objectId, row.getTableId().catalog());
+                if (resolved != null) {
+                    if (getSchema().registerTableObjectId(resolved, objectId, dataObjectId)) {
+                        return resolved;
+                    }
+                    return skipForeignObjectId(objectId);
                 }
-                return skipObjectId(row, objectId, ObjectIdSkipReason.NOT_CAPTURED);
             }
         }
-
-        if (!getSchema().isObjectIdRegistryComplete()) {
-            // A captured table has no registered object id, so this event cannot be shown to belong to
-            // someone else. Leave that judgement to the operator's configured mode.
-            return notifyUnidentifiableObject(row, objectId);
-        }
-        return skipObjectId(row, objectId, ObjectIdSkipReason.UNRESOLVABLE);
+        return handleUnresolvableObjectId(row, objectId);
     }
 
     /**
-     * Handles an event whose table cannot be identified and cannot be shown to be outside the capture
-     * set, honoring {@code event.processing.failure.handling.mode} (upstream DBZ-8208 semantics).
+     * Skips an event whose object id resolved to an existing table outside the capture set, which the
+     * capture-set filter would drop anyway. Recording the decision keeps a burst on one foreign object
+     * off the database.
      *
-     * @param row the result set row, should not be {@code null}
-     * @param objectId the object id, {@code null} when the row carries none
-     * @return {@code null} when the event is to be skipped
+     * @param objectId the object id, should not be {@code null}
+     * @return {@code null} always, instructing the caller to skip the event
      */
-    private TableId notifyUnidentifiableObject(LogMinerEventRow row, Long objectId) {
-        final String reason = objectId == null
-                ? "Oracle LogMiner event '" + row + "' carries no object id"
-                : "Object id " + objectId + " could not be resolved, and captured tables "
-                        + getSchema().getCapturedTablesWithoutObjectId() + " have no registered object id";
-        switch (connectorConfig.getEventProcessingFailureHandlingMode()) {
-            case FAIL:
-                LOGGER.error("{}; its table cannot be identified.", reason);
-                throw new DebeziumException(reason + "; its table cannot be identified");
-            case WARN:
-                LOGGER.warn("{}. The event will be ignored and skipped.", reason);
-                metrics.incrementWarningCount();
-                break;
-            default:
-                LOGGER.debug("{}. The event will be ignored and skipped.", reason);
-                break;
-        }
-        if (objectId != null) {
-            getSchema().registerSkippedObjectId(objectId, ObjectIdSkipReason.UNRESOLVABLE);
+    private TableId skipForeignObjectId(Long objectId) {
+        if (getSchema().registerSkippedObjectId(objectId, ObjectIdSkipReason.NOT_CAPTURED)) {
+            LOGGER.debug("Object id {} belongs to a table outside the capture set; its events will be skipped.", objectId);
         }
         return null;
     }
 
     /**
-     * Deliberately does not consult {@code event.processing.failure.handling.mode}. The hybrid mining
-     * query must admit {@code OBJ# <n>} and {@code SEG_OWNER='UNKNOWN'} rows from the whole database,
-     * since a purged object keeps no owner or name to filter on server-side; failing on one lets
-     * unrelated activity stop the connector for good, because the offset never advances past it.
-     * Neither reason can discard captured data: NOT_CAPTURED resolved outside the capture set, and
-     * UNRESOLVABLE only reaches here once every captured table has a registered object id.
+     * Handles an event whose object id names no table at all, in the registry or in the database.
+     * <p>
+     * Nothing separates another application's purged table from a captured table's own object id
+     * destroyed while the connector was not reading - a partition dropped, split, merged or exchanged,
+     * or a captured table purged and recreated - because a purged object keeps no owner or name. The
+     * connector therefore does not decide: by default it defers to
+     * {@code event.processing.failure.handling.mode}, and discarding the event is opt-in through
+     * {@code log.mining.unresolvable.object.id.handling.mode}.
      *
      * @param row the result set row, should not be {@code null}
-     * @param objectId the object id, should not be {@code null}
-     * @param reason why the event is skipped, should not be {@code null}
-     * @return {@code null} always, instructing the caller to skip the event
+     * @param objectId the object id, {@code null} when the row carries none
+     * @return {@code null} when the event is to be skipped
      */
-    private TableId skipObjectId(LogMinerEventRow row, Long objectId, ObjectIdSkipReason reason) {
-        getSchema().registerSkippedObjectId(objectId, reason);
-        if (ObjectIdSkipReason.NOT_CAPTURED.equals(reason)) {
-            LOGGER.debug("Object id {} belongs to a table outside the capture set. The event '{}' will be skipped.", objectId, row);
+    private TableId handleUnresolvableObjectId(LogMinerEventRow row, Long objectId) {
+        final boolean firstEncounter = objectId == null
+                || getSchema().registerSkippedObjectId(objectId, ObjectIdSkipReason.UNRESOLVABLE);
+
+        boolean reportAsWarning = OracleConnectorConfig.UnresolvableObjectIdHandlingMode.SKIP
+                .equals(connectorConfig.getUnresolvableObjectIdHandlingMode());
+        if (!reportAsWarning) {
+            switch (connectorConfig.getEventProcessingFailureHandlingMode()) {
+                case FAIL:
+                    LOGGER.error("Failed to resolve table name by object id lookup for event '{}'", row);
+                    throw new DebeziumException("Failed to resolve table name by object id " + objectId + " lookup");
+                case WARN:
+                    reportAsWarning = true;
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        unresolvableSkippedEvents++;
+        if (objectId != null) {
+            unresolvableSkippedObjectIds.add(objectId);
+        }
+        if (reportAsWarning && firstEncounter) {
+            LOGGER.warn("Failed to resolve table name by object id {} lookup. The event '{}' will be ignored and skipped. "
+                    + "If this object was a captured table's, those changes are lost.", objectId, row);
+            metrics.incrementWarningCount();
         }
         else {
-            LOGGER.warn("Object id {} does not belong to a captured table and no longer exists in the database. "
-                    + "The event '{}' will be ignored and skipped.", objectId, row);
-            metrics.incrementWarningCount();
+            LOGGER.debug("Failed to resolve table name by object id {} lookup. The event '{}' will be ignored and skipped.", objectId, row);
         }
         return null;
     }

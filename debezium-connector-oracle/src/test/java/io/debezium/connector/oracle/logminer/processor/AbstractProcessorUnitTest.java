@@ -279,7 +279,7 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
 
     @Test
     public void testCachedSkipDecisionIsAppliedWithoutAnotherLookup() throws Exception {
-        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig().build());
+        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridSkipConfig().build());
         try (T processor = getProcessor(config)) {
             schema.registerSkippedObjectId(PURGED_OBJECT_ID, ObjectIdSkipReason.UNRESOLVABLE);
             final int warningsBefore = metrics.getWarningCount();
@@ -357,10 +357,10 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
         assertThat(schema.getObjectIdSkipReason(cacheSize + 10L)).isEqualTo(ObjectIdSkipReason.NOT_CAPTURED);
     }
 
-    /** The production failure: a dropped and purged object reached the processor and stopped it. */
+    /** The production failure, with the operator having opted into discarding what cannot be named. */
     @Test
-    public void testUnresolvableObjectIdIsSkippedOnFirstEncounter() throws Exception {
-        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig().build());
+    public void testUnresolvableObjectIdIsSkippedWhenConfigured() throws Exception {
+        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridSkipConfig().build());
         try (T processor = getProcessor(config)) {
             assertThat(schema.getObjectIdSkipReason(PURGED_OBJECT_ID)).isNull();
             final int warningsBefore = metrics.getWarningCount();
@@ -373,48 +373,34 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
         }
     }
 
-    @Test
-    public void testRecycleBinMissFallsBackToObjectIdResolution() throws Exception {
+    /** The default must behave exactly as it did before this option existed: the operator decides. */
+    @Test(expected = DebeziumException.class)
+    public void testUnresolvableObjectIdFailsByDefault() throws Exception {
         final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig().build());
+        assertThat(config.getUnresolvableObjectIdHandlingMode())
+                .isEqualTo(OracleConnectorConfig.UnresolvableObjectIdHandlingMode.INHERIT);
+        try (T processor = getProcessor(config)) {
+            processor.handleDataEvent(getPurgedObjectLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1));
+        }
+    }
+
+    /** Opting in must not weaken anything else: a resolvable captured object still resolves. */
+    @Test
+    public void testSkipModeStillResolvesRegisteredObjectIds() throws Exception {
+        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridSkipConfig().build());
         try (T processor = getProcessor(config)) {
             assertThat(schema.registerTableObjectId(CAPTURED_TABLE, PURGED_OBJECT_ID, null)).isTrue();
 
-            processor.handleDataEvent(getRecycleBinLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1));
+            processor.handleDataEvent(getPurgedObjectLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1));
 
             assertThat(processor.getTransactionCache().isEmpty()).isFalse();
-        }
-    }
-
-    /** F1: with a captured table unaccounted for, an unresolvable id is the operator's call again. */
-    @Test(expected = DebeziumException.class)
-    public void testUnresolvableObjectIdStillFailsWhenACapturedTableHasNoObjectId() throws Exception {
-        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig().build());
-        try (T processor = getProcessor(config)) {
-            schema.registerCapturedTableWithoutObjectId(CAPTURED_TABLE);
-            assertThat(schema.isObjectIdRegistryComplete()).isFalse();
-
-            processor.handleDataEvent(getPurgedObjectLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1));
-        }
-    }
-
-    @Test
-    public void testRegisteringTheMissingObjectIdRestoresSkipping() throws Exception {
-        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig().build());
-        try (T processor = getProcessor(config)) {
-            schema.registerCapturedTableWithoutObjectId(CAPTURED_TABLE);
-            assertThat(schema.registerTableObjectId(CAPTURED_TABLE, 999999L, null)).isTrue();
-            assertThat(schema.isObjectIdRegistryComplete()).isTrue();
-
-            processor.handleDataEvent(getPurgedObjectLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1));
-
-            assertThat(processor.getTransactionCache().isEmpty()).isTrue();
         }
     }
 
     /** F2: a burst on one purged object must not emit a warning per row. */
     @Test
     public void testRepeatedEventsForOneUnresolvableObjectWarnOnce() throws Exception {
-        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig().build());
+        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridSkipConfig().build());
         try (T processor = getProcessor(config)) {
             processor.handleDataEvent(getPurgedObjectLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1));
             final int warningsAfterFirst = metrics.getWarningCount();
@@ -424,20 +410,6 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
             }
 
             assertThat(metrics.getWarningCount()).isEqualTo(warningsAfterFirst);
-        }
-    }
-
-    /** F3: a registered object id answers a BIN$ row without touching DBA_RECYCLEBIN. */
-    @Test
-    public void testRecycleBinRowResolvedFromRegistryWithoutQuery() throws Exception {
-        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig().build());
-        try (T processor = getProcessor(config)) {
-            assertThat(schema.registerTableObjectId(CAPTURED_TABLE, PURGED_OBJECT_ID, null)).isTrue();
-
-            processor.handleDataEvent(getRecycleBinLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1));
-
-            assertThat(processor.getTransactionCache().isEmpty()).isFalse();
-            Mockito.verify(connection, Mockito.never()).prepareQueryAndMap(anyString(), any(), any());
         }
     }
 
@@ -459,6 +431,10 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
 
     private Configuration.Builder getHybridConfig() {
         return getCapturedConfig().with(OracleConnectorConfig.LOG_MINING_STRATEGY, "hybrid");
+    }
+
+    private Configuration.Builder getHybridSkipConfig() {
+        return getHybridConfig().with(OracleConnectorConfig.LOG_MINING_UNRESOLVABLE_OBJECT_ID_HANDLING_MODE, "skip");
     }
 
     /** An explicit capture set: the default configuration includes every table, so nothing is outside it. */
@@ -566,15 +542,6 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
         Mockito.when(row.getRsId()).thenReturn("A.B.C");
         Mockito.when(row.getTablespaceName()).thenReturn("DEBEZIUM");
         Mockito.when(row.getUserName()).thenReturn(TestHelper.SCHEMA_USER);
-        return row;
-    }
-
-    private LogMinerEventRow getRecycleBinLogMinerEventRow(Scn scn, String transactionId) {
-        final String recycleBinName = "BIN$aBcDeFgHiJkLmNoPqRsTuV==$0";
-        LogMinerEventRow row = getInsertLogMinerEventRow(scn, transactionId, Instant.now());
-        Mockito.when(row.getTableName()).thenReturn(recycleBinName);
-        Mockito.when(row.getTableId()).thenReturn(new TableId("ORCLPDB1", "DEBEZIUM", recycleBinName));
-        Mockito.when(row.getObjectId()).thenReturn(PURGED_OBJECT_ID);
         return row;
     }
 

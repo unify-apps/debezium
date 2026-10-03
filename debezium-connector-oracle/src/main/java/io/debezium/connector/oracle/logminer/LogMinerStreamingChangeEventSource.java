@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -347,14 +348,45 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
                     registered++;
                 }
                 else {
-                    // Dropped and purged since the offset was written: nothing can map its object id
-                    // back, so unresolvable events can no longer be presumed to be another's.
-                    schema.registerCapturedTableWithoutObjectId(tableId);
-                    LOGGER.warn("Captured table {} no longer exists; events carrying its object id cannot be "
-                            + "identified and will be handled by event.processing.failure.handling.mode.", tableId);
+                    // Dropped and purged since the offset was written, so nothing can map its object id
+                    // back; its trailing events resolve to no table at all.
+                    LOGGER.warn("Captured table {} no longer exists in the database; events still carrying its object id "
+                            + "cannot be identified.", tableId);
                 }
             }
             LOGGER.info("Hybrid mining strategy: registered object ids for {} captured tables.", registered);
+            warnIfSkippingUnresolvableObjectIdsIsUnsafe(connection);
+        }
+    }
+
+    /**
+     * Warns when the capture set contains a partitioned table and unresolvable object ids are being
+     * discarded. DML on a partitioned table carries the partition's object id, and partition
+     * maintenance destroys those ids, so a destroyed one is indistinguishable from a foreign object
+     * and its changes are discarded with them.
+     *
+     * @param connection the connection used to warm the registry, should not be {@code null}
+     * @throws SQLException if a database exception occurred
+     */
+    private void warnIfSkippingUnresolvableObjectIdsIsUnsafe(OracleConnection connection) throws SQLException {
+        if (!OracleConnectorConfig.UnresolvableObjectIdHandlingMode.SKIP
+                .equals(connectorConfig.getUnresolvableObjectIdHandlingMode())) {
+            return;
+        }
+        final Set<TableId> partitioned = new LinkedHashSet<>();
+        final Set<String> owners = schema.tableIds().stream().map(TableId::schema).collect(Collectors.toSet());
+        for (String owner : owners) {
+            final Set<String> partitionedNames = connection.getPartitionedTableNames(owner);
+            schema.tableIds().stream()
+                    .filter(id -> owner.equals(id.schema()) && partitionedNames.contains(id.table()))
+                    .forEach(partitioned::add);
+        }
+        if (!partitioned.isEmpty()) {
+            LOGGER.warn("log.mining.unresolvable.object.id.handling.mode is set to skip and the capture set contains "
+                    + "partitioned tables {}. Their change events carry partition object ids, which partition "
+                    + "maintenance destroys; events carrying a destroyed id cannot be distinguished from another "
+                    + "application's purged table and will be discarded. Avoid partition maintenance while the "
+                    + "connector is behind, or leave this property at its default.", partitioned);
         }
     }
 
