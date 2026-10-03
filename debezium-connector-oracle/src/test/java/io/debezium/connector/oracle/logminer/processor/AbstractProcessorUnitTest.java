@@ -297,9 +297,11 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
         final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig().build());
         try (T processor = getProcessor(config)) {
             schema.registerTableObjectId(CAPTURED_TABLE, PURGED_OBJECT_ID, null);
+            final LogMinerEventRow row = getPurgedObjectLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1);
 
-            processor.handleDataEvent(getPurgedObjectLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1));
+            processor.handleDataEvent(row);
 
+            Mockito.verify(row).setTableId(CAPTURED_TABLE);
             assertThat(processor.getTransactionCache().isEmpty()).isFalse();
         }
     }
@@ -423,18 +425,37 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
         }
     }
 
-    /** The branch hybrid exists for: LogMiner lost the name, ALL_OBJECTS still knows the table. */
+    /**
+     * The branch hybrid exists for: LogMiner lost the name, ALL_OBJECTS still knows the table.
+     * The event is dispatched under the row's own identifier, so resolving is only half the job -
+     * the row must carry the resolved identity or the event is dropped at commit.
+     */
     @Test
-    public void testLiveLookupResolvingACapturedTableEmitsAndRegistersIt() throws Exception {
+    public void testLiveLookupResolvingACapturedTableRewritesTheRowIdentity() throws Exception {
         final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig().build());
         try (T processor = getProcessor(config)) {
             Mockito.when(connection.resolveTableIdByObjectId(Mockito.anyLong(), anyString())).thenReturn(CAPTURED_TABLE);
+            final LogMinerEventRow row = getPurgedObjectLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1);
 
-            processor.handleDataEvent(getPurgedObjectLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1));
+            processor.handleDataEvent(row);
 
+            Mockito.verify(row).setTableId(CAPTURED_TABLE);
             assertThat(processor.getTransactionCache().isEmpty()).isFalse();
             assertThat(schema.getTableIdByObjectId(PURGED_OBJECT_ID, null)).isEqualTo(CAPTURED_TABLE);
             assertThat(schema.getObjectIdSkipReason(PURGED_OBJECT_ID)).isNull();
+        }
+    }
+
+    /** A row LogMiner named correctly must not be rewritten. */
+    @Test
+    public void testNamedRowIdentityIsLeftAlone() throws Exception {
+        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig().build());
+        try (T processor = getProcessor(config)) {
+            final LogMinerEventRow row = getInsertLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1);
+
+            processor.handleDataEvent(row);
+
+            Mockito.verify(row, Mockito.never()).setTableId(Mockito.any());
         }
     }
 

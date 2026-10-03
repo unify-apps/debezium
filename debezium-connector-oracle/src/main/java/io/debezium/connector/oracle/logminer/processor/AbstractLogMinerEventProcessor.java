@@ -886,6 +886,11 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
         if (tableId == null) {
             return null;
         }
+        if (!tableId.equals(row.getTableId())) {
+            // The event is emitted and filtered under the row's own identifier at commit time, so a
+            // resolved identity has to replace it rather than only inform the parse.
+            row.setTableId(tableId);
+        }
         Table table = getSchema().tableFor(tableId);
         if (table == null) {
             if (!getConfig().getTableFilters().dataCollectionFilter().isIncluded(tableId)) {
