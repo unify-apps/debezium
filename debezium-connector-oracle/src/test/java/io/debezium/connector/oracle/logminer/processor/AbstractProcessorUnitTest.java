@@ -17,6 +17,7 @@ import java.sql.ResultSet;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.After;
 import org.junit.Before;
@@ -446,6 +447,26 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
         }
     }
 
+    /**
+     * End to end: a resolved event must be DISPATCHED under the resolved table, not merely parsed
+     * with it. Dispatch filters on the identifier the event carries, so an event emitted under
+     * "UNKNOWN.OBJ# <n>" is discarded no matter how correctly it was resolved and parsed.
+     */
+    @Test
+    public void testResolvedEventIsDispatchedUnderTheResolvedTable() throws Exception {
+        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig().build());
+        try (T processor = getProcessor(config)) {
+            schema.registerTableObjectId(CAPTURED_TABLE, PURGED_OBJECT_ID, null);
+            Mockito.when(offsetContext.getScn()).thenReturn(Scn.valueOf(1L));
+
+            processor.handleStart(getStartLogMinerEventRow(Scn.valueOf(1L), TRANSACTION_ID_1));
+            processor.handleDataEvent(getPurgedObjectLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1));
+            processor.handleCommit(partition, getCommitLogMinerEventRow(Scn.valueOf(3L), TRANSACTION_ID_1));
+
+            Mockito.verify(dispatcher).dispatchDataChangeEvent(Mockito.any(), Mockito.eq(CAPTURED_TABLE), Mockito.any());
+        }
+    }
+
     /** A row LogMiner named correctly must not be rewritten. */
     @Test
     public void testNamedRowIdentityIsLeftAlone() throws Exception {
@@ -612,9 +633,16 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
     private LogMinerEventRow getPurgedObjectLogMinerEventRow(Scn scn, String transactionId) {
         LogMinerEventRow row = getInsertLogMinerEventRow(scn, transactionId, Instant.now());
         Mockito.when(row.getTableName()).thenReturn("OBJ# " + PURGED_OBJECT_ID);
-        Mockito.when(row.getTableId()).thenReturn(new TableId("ORCLPDB1", "UNKNOWN", "OBJ# " + PURGED_OBJECT_ID));
         Mockito.when(row.getTablespaceName()).thenReturn("UNKNOWN");
         Mockito.when(row.getObjectId()).thenReturn(PURGED_OBJECT_ID);
+        // The real row is mutable and the event is dispatched under whatever it ends up holding, so a
+        // mock that ignored setTableId would hide exactly the defect these tests exist to catch.
+        final AtomicReference<TableId> identity = new AtomicReference<>(new TableId("ORCLPDB1", "UNKNOWN", "OBJ# " + PURGED_OBJECT_ID));
+        Mockito.when(row.getTableId()).thenAnswer(invocation -> identity.get());
+        Mockito.doAnswer(invocation -> {
+            identity.set(invocation.getArgument(0));
+            return null;
+        }).when(row).setTableId(Mockito.any());
         return row;
     }
 
