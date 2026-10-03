@@ -336,6 +336,16 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
         assertThat(schema.getTableIdByObjectId(PURGED_OBJECT_ID, null)).isEqualTo(captured);
     }
 
+    /** A changed DATA_OBJECT_ID (truncate, move) must not answer from the stale entry. */
+    @Test
+    public void testDataObjectIdMismatchIsTreatedAsARegistryMiss() {
+        assertThat(schema.registerTableObjectId(CAPTURED_TABLE, PURGED_OBJECT_ID, 5L)).isTrue();
+
+        assertThat(schema.getTableIdByObjectId(PURGED_OBJECT_ID, 5L)).isEqualTo(CAPTURED_TABLE);
+        assertThat(schema.getTableIdByObjectId(PURGED_OBJECT_ID, 9L)).isNull();
+        assertThat(schema.getTableIdByObjectId(PURGED_OBJECT_ID, null)).isEqualTo(CAPTURED_TABLE);
+    }
+
     @Test
     public void testRegisteringTableObjectIdClearsAPriorSkipDecision() {
         schema.registerSkippedObjectId(PURGED_OBJECT_ID, ObjectIdSkipReason.UNRESOLVABLE);
@@ -410,6 +420,39 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
             }
 
             assertThat(metrics.getWarningCount()).isEqualTo(warningsAfterFirst);
+        }
+    }
+
+    /** The branch hybrid exists for: LogMiner lost the name, ALL_OBJECTS still knows the table. */
+    @Test
+    public void testLiveLookupResolvingACapturedTableEmitsAndRegistersIt() throws Exception {
+        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig().build());
+        try (T processor = getProcessor(config)) {
+            Mockito.when(connection.resolveTableIdByObjectId(Mockito.anyLong(), anyString())).thenReturn(CAPTURED_TABLE);
+
+            processor.handleDataEvent(getPurgedObjectLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1));
+
+            assertThat(processor.getTransactionCache().isEmpty()).isFalse();
+            assertThat(schema.getTableIdByObjectId(PURGED_OBJECT_ID, null)).isEqualTo(CAPTURED_TABLE);
+            assertThat(schema.getObjectIdSkipReason(PURGED_OBJECT_ID)).isNull();
+        }
+    }
+
+    /** Resolving to a real table outside the capture set is the one skip that is actually provable. */
+    @Test
+    public void testLiveLookupResolvingAForeignTableSkipsWithoutWarning() throws Exception {
+        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig().build());
+        try (T processor = getProcessor(config)) {
+            Mockito.when(connection.resolveTableIdByObjectId(Mockito.anyLong(), anyString()))
+                    .thenReturn(TableId.parse("ORCLPDB1.SOMEONE_ELSE.FOREIGN_TABLE"));
+            final int warningsBefore = metrics.getWarningCount();
+
+            processor.handleDataEvent(getPurgedObjectLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1));
+
+            assertThat(processor.getTransactionCache().isEmpty()).isTrue();
+            assertThat(metrics.getWarningCount()).isEqualTo(warningsBefore);
+            assertThat(schema.getObjectIdSkipReason(PURGED_OBJECT_ID)).isEqualTo(ObjectIdSkipReason.NOT_CAPTURED);
+            assertThat(schema.getTableIdByObjectId(PURGED_OBJECT_ID, null)).isNull();
         }
     }
 
