@@ -505,20 +505,19 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
             .withValidation(Field::isPositiveInteger)
             .withDescription("The maximum number of entries in the object-id-to-table-id negative lookup cache used by the hybrid mining strategy.");
 
-    public static final Field LOG_MINING_UNRESOLVABLE_OBJECT_ID_HANDLING_MODE = Field.create("log.mining.unresolvable.object.id.handling.mode")
+    public static final Field LOG_MINING_UNRESOLVABLE_OBJECT_ID_HANDLING_MODE = Field.createInternal("log.mining.unresolvable.object.id.handling.mode")
             .withDisplayName("Unresolvable object id handling")
-            .withEnum(UnresolvableObjectIdHandlingMode.class, UnresolvableObjectIdHandlingMode.INHERIT)
+            .withEnum(UnresolvableObjectIdHandlingMode.class, UnresolvableObjectIdHandlingMode.SKIP)
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
             .withDescription("Specifies what the hybrid mining strategy does with a change event whose Oracle object id "
                     + "cannot be resolved to any table, which happens when an object is dropped and purged while its redo "
                     + "has not been read yet." + System.lineSeparator()
-                    + "inherit - defers to event.processing.failure.handling.mode, the default, which fails the connector." + System.lineSeparator()
-                    + "skip - discards the event. This keeps the connector running when another application's purged table "
-                    + "appears in the redo stream, but a purged object carries nothing that identifies its owner, so an "
-                    + "object id of a captured table that was destroyed while the connector was not reading - a partition "
-                    + "dropped, split, merged or exchanged, or a captured table purged and recreated - is discarded the "
-                    + "same way, losing those changes.");
+                    + "skip - the default, discards the event and logs it. A purged object carries nothing that identifies "
+                    + "its owner, so an object id of a captured table that was destroyed while the connector was not reading "
+                    + "- a partition dropped, split, merged or exchanged, or a captured table purged and recreated - is "
+                    + "discarded the same way, losing those changes." + System.lineSeparator()
+                    + "inherit - defers to event.processing.failure.handling.mode.");
 
     private static final ConfigDefinition CONFIG_DEFINITION = HistorizedRelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
             .name("Oracle")
@@ -1128,8 +1127,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
 
     /**
      * What the hybrid mining strategy does with an event whose object id resolves to no table at all.
-     * A purged object keeps no owner or name, so the connector cannot tell whose it was; this is the
-     * operator's answer to that, not something the connector can decide for them.
+     * A purged object keeps no owner or name, so the connector cannot tell whose it was.
      */
     public enum UnresolvableObjectIdHandlingMode implements EnumeratedValue {
 

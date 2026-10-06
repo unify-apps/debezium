@@ -32,7 +32,6 @@ import io.debezium.connector.oracle.OracleConnection;
 import io.debezium.connector.oracle.OracleConnection.NonRelationalTableException;
 import io.debezium.connector.oracle.OracleConnectorConfig;
 import io.debezium.connector.oracle.OracleDatabaseSchema;
-import io.debezium.connector.oracle.OracleDatabaseSchema.ObjectIdSkipReason;
 import io.debezium.connector.oracle.OracleOffsetContext;
 import io.debezium.connector.oracle.OraclePartition;
 import io.debezium.connector.oracle.OracleSchemaChangeEventEmitter;
@@ -288,7 +287,7 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
     /**
      * Reports how much this batch discarded for object ids that named no table. The per-id warning says
      * which object, this says how many events went with it, which is the number that matters when
-     * {@code log.mining.unresolvable.object.id.handling.mode} is set to skip.
+     * unresolvable object ids are skipped.
      */
     private void reportUnresolvableObjectIdSkips() {
         if (unresolvableSkippedEvents > 0) {
@@ -939,80 +938,38 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
     }
 
     /**
-     * Resolves a table identifier from the event row's object id: the registry first, then a decision
-     * already taken for that id, then a live {@code ALL_OBJECTS} lookup (upstream DBZ-8399 semantics).
-     * <p>
-     * The two outcomes are not equally informative. An id that resolves to an existing table outside
-     * the capture set is proven to be someone else's and is skipped. An id that resolves to nothing
-     * proves nothing - a purged object keeps no owner or name - and is left to the operator's
-     * configuration.
+     * Resolves a table identifier from the event row's object id using the registry only: LogMiner
+     * names every object that still exists, so an {@code OBJ#} row means the object is gone.
      *
      * @param row the result set row, should not be {@code null}
      * @return the resolved table identifier, or {@code null} if the event should be skipped
-     * @throws SQLException if a database exception occurred
      */
-    private TableId resolveTableIdByObjectId(LogMinerEventRow row) throws SQLException {
+    private TableId resolveTableIdByObjectId(LogMinerEventRow row) {
         final Long objectId = row.getObjectId() != 0 ? row.getObjectId() : null;
         final Long dataObjectId = row.getDataObjectId() != 0 ? row.getDataObjectId() : null;
-        if (objectId == null) {
-            return handleUnresolvableObjectId(row, null);
-        }
-
-        final TableId registered = getSchema().getTableIdByObjectId(objectId, dataObjectId);
-        if (registered != null) {
-            return registered;
-        }
-
-        final ObjectIdSkipReason decided = getSchema().getObjectIdSkipReason(objectId);
-        if (ObjectIdSkipReason.NOT_CAPTURED.equals(decided)) {
-            return skipForeignObjectId(objectId);
-        }
-        if (decided == null) {
-            try (OracleConnection connection = createOutOfBandsConnection()) {
-                final TableId resolved = connection.resolveTableIdByObjectId(objectId, row.getTableId().catalog());
-                if (resolved != null) {
-                    if (getSchema().registerTableObjectId(resolved, objectId, dataObjectId)) {
-                        return resolved;
-                    }
-                    return skipForeignObjectId(objectId);
-                }
+        if (objectId != null) {
+            final TableId registered = getSchema().getTableIdByObjectId(objectId, dataObjectId);
+            if (registered != null) {
+                return registered;
             }
         }
         return handleUnresolvableObjectId(row, objectId);
     }
 
     /**
-     * Skips an event whose object id resolved to an existing table outside the capture set, which the
-     * capture-set filter would drop anyway. Recording the decision keeps a burst on one foreign object
-     * off the database.
-     *
-     * @param objectId the object id, should not be {@code null}
-     * @return {@code null} always, instructing the caller to skip the event
-     */
-    private TableId skipForeignObjectId(Long objectId) {
-        if (getSchema().registerSkippedObjectId(objectId, ObjectIdSkipReason.NOT_CAPTURED)) {
-            LOGGER.debug("Object id {} belongs to a table outside the capture set; its events will be skipped.", objectId);
-        }
-        return null;
-    }
-
-    /**
-     * Handles an event whose object id names no table at all, in the registry or in the database.
+     * Handles an event whose object id names no captured table.
      * <p>
      * Nothing separates another application's purged table from a captured table's own object id
      * destroyed while the connector was not reading - a partition dropped, split, merged or exchanged,
-     * or a captured table purged and recreated - because a purged object keeps no owner or name. The
-     * connector therefore does not decide: by default it defers to
-     * {@code event.processing.failure.handling.mode}, and discarding the event is opt-in through
-     * {@code log.mining.unresolvable.object.id.handling.mode}.
+     * or a captured table purged and recreated - because a purged object keeps no owner or name. Such
+     * events are skipped unless the handling mode is {@code inherit}.
      *
      * @param row the result set row, should not be {@code null}
      * @param objectId the object id, {@code null} when the row carries none
      * @return {@code null} when the event is to be skipped
      */
     private TableId handleUnresolvableObjectId(LogMinerEventRow row, Long objectId) {
-        final boolean firstEncounter = objectId == null
-                || getSchema().registerSkippedObjectId(objectId, ObjectIdSkipReason.UNRESOLVABLE);
+        final boolean firstEncounter = objectId == null || getSchema().registerUnresolvableObjectId(objectId);
 
         boolean reportAsWarning = OracleConnectorConfig.UnresolvableObjectIdHandlingMode.SKIP
                 .equals(connectorConfig.getUnresolvableObjectIdHandlingMode());
@@ -1048,7 +1005,7 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
      * Creates a short-lived out-of-bands connection for lookups performed while the LogMiner result
      * set is being processed, positioned to the PDB when one is configured.
      *
-     * Overridable so tests can reach the identity-resolution branches without a live database.
+     * Overridable so tests can observe when a lookup reaches the database.
      *
      * @return the connection, never {@code null}; the caller is responsible for closing it
      * @throws SQLException if a database exception occurred

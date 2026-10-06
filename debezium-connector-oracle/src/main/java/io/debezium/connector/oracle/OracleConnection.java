@@ -669,26 +669,6 @@ public class OracleConnection extends JdbcConnection {
     }
 
     /**
-     * Get the names of the partitioned tables owned by the given schema.
-     *
-     * @param owner the schema name, should not be {@code null}
-     * @return the partitioned table names, never {@code null}
-     * @throws SQLException if a database exception occurred
-     */
-    public Set<String> getPartitionedTableNames(String owner) throws SQLException {
-        return prepareQueryAndMap(
-                "SELECT TABLE_NAME FROM ALL_TABLES WHERE OWNER=? AND PARTITIONED='YES'",
-                ps -> ps.setString(1, owner),
-                rs -> {
-                    final Set<String> names = new HashSet<>();
-                    while (rs.next()) {
-                        names.add(rs.getString(1));
-                    }
-                    return names;
-                });
-    }
-
-    /**
      * Get the table's Oracle {@code DATA_OBJECT_ID} from {@code ALL_OBJECTS}.
      *
      * @param tableId the table identifier, should not be {@code null}
@@ -708,27 +688,6 @@ public class OracleConnection extends JdbcConnection {
                     }
                     return null;
                 });
-    }
-
-    /**
-     * Resolves the owning table of the given Oracle object id from {@code ALL_OBJECTS}.
-     *
-     * Note that a dropped and purged object no longer exists in {@code ALL_OBJECTS} and cannot be
-     * resolved by this method; such lookups return {@code null}.
-     *
-     * @param objectId the object id to resolve, should not be {@code null}
-     * @param catalogName the catalog name to associate with the resolved identifier
-     * @return the resolved table identifier, or {@code null} if the object id was not found
-     * @throws SQLException if a database exception occurred
-     */
-    public TableId resolveTableIdByObjectId(Long objectId, String catalogName) throws SQLException {
-        // Partitions are admitted because a partitioned table has no table-level data object, so DML on
-        // one carries the partition's object id. Their OBJECT_NAME is the table's, so the identifier
-        // resolves to the table either way.
-        return prepareQueryAndMap(
-                "SELECT OWNER, OBJECT_NAME FROM ALL_OBJECTS WHERE OBJECT_TYPE IN ('TABLE','TABLE PARTITION','TABLE SUBPARTITION') AND OBJECT_ID=?",
-                ps -> ps.setLong(1, objectId),
-                rs -> rs.next() ? new TableId(catalogName, rs.getString(1), rs.getString(2)) : null);
     }
 
     /**

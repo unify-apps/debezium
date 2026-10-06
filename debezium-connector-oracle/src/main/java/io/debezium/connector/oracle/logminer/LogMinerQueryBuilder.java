@@ -24,7 +24,6 @@ public class LogMinerQueryBuilder {
     private static final String LOGMNR_CONTENTS_VIEW = "V$LOGMNR_CONTENTS";
     private static final String UNKNOWN_SCHEMA_NAME = "UNKNOWN";
     private static final String UNKNOWN_TABLE_NAME_PREFIX = "OBJ#";
-    private static final String RECYCLEBIN_TABLE_NAME_PREFIX = "BIN$";
 
     /**
      * Builds the LogMiner contents view query.
@@ -224,13 +223,7 @@ public class LogMinerQueryBuilder {
             if (isUsingHybridStrategy(connectorConfig)) {
                 // Makes sure we get rows that have had an issue resolving the table's object identifier
                 // due to a recent schema change causing a dictionary mismatch (upstream DBZ-8926 semantics).
-                // A dropped and purged object is reported as "OBJ# <n>"; a dropped but not yet purged
-                // object is reported with its recycle-bin "BIN$...==$0" name. Upstream's default query
-                // filter mode applies no server-side table predicate at all, so both row shapes reach the
-                // connector there; because this builder always applies the include-list predicate
-                // server-side, both prefixes must be admitted explicitly here.
                 predicate.append("TABLE_NAME LIKE '").append(UNKNOWN_TABLE_NAME_PREFIX).append("%' OR ");
-                predicate.append("TABLE_NAME LIKE '").append(RECYCLEBIN_TABLE_NAME_PREFIX).append("%' OR ");
             }
             predicate.append(listOfPatternsToSql(patterns, "SEG_OWNER || '.' || TABLE_NAME", false)).append(")");
         }

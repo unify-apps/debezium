@@ -185,6 +185,9 @@ public class OracleSchemaChangeEventEmitter implements SchemaChangeEventEmitter 
     }
 
     private SchemaChangeEvent dropTableEvent(OraclePartition partition, Table tableSchemaBeforeDrop, TableDroppedEvent event) {
+        if (filters.isIncluded(tableId)) {
+            LOGGER.warn("Captured table {} was dropped; changes to it still in flight at that point may not reach the destination.", tableId);
+        }
         // Intentionally no object-id registration: the pre-drop mapping must stay intact so trailing
         // DML events that precede the drop in the redo stream can still be resolved.
         offsetContext.tableEvent(tableId, changeTime);

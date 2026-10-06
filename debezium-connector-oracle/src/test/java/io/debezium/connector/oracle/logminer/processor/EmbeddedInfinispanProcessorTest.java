@@ -52,9 +52,9 @@ public class EmbeddedInfinispanProcessorTest extends AbstractProcessorUnitTest<A
                 offsetContext,
                 schema,
                 metrics) {
-            // Unstubbed lookups on the mock answer null: the dropped-and-purged case.
             @Override
             protected OracleConnection createOutOfBandsConnection() {
+                outOfBandConnections++;
                 return connection;
             }
         };
