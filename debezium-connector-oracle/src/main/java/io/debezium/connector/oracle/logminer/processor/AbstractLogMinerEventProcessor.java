@@ -13,10 +13,12 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.regex.Matcher;
@@ -99,6 +101,10 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
     private Scn currentOffsetScn = Scn.NULL;
     private Map<Integer, Scn> currentOffsetCommitScns = new HashMap<>();
     private Scn lastProcessedScn = Scn.NULL;
+
+    /** Discarded in the current mining batch because their object id named no table; reported per batch. */
+    private final Set<Long> unresolvableSkippedObjectIds = new HashSet<>();
+    private long unresolvableSkippedEvents;
     private boolean sequenceUnavailable = false;
 
     public AbstractLogMinerEventProcessor(ChangeEventSourceContext context,
@@ -274,6 +280,21 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
         while (context.isRunning() && hasNextWithMetricsUpdate(resultSet)) {
             counters.rows++;
             processRow(partition, LogMinerEventRow.fromResultSet(resultSet, getConfig().getCatalogName(), isTrxIdRawValue()));
+        }
+        reportUnresolvableObjectIdSkips();
+    }
+
+    /**
+     * Reports how much this batch discarded for object ids that named no table. The per-id warning says
+     * which object, this says how many events went with it, which is the number that matters when
+     * unresolvable object ids are skipped.
+     */
+    private void reportUnresolvableObjectIdSkips() {
+        if (unresolvableSkippedEvents > 0) {
+            LOGGER.warn("Skipped {} change events across {} unresolvable object ids in this mining batch.",
+                    unresolvableSkippedEvents, unresolvableSkippedObjectIds.size());
+            unresolvableSkippedEvents = 0;
+            unresolvableSkippedObjectIds.clear();
         }
     }
 
@@ -864,6 +885,11 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
         if (tableId == null) {
             return null;
         }
+        if (!tableId.equals(row.getTableId())) {
+            // The event is emitted and filtered under the row's own identifier at commit time, so a
+            // resolved identity has to replace it rather than only inform the parse.
+            row.setTableId(tableId);
+        }
         Table table = getSchema().tableFor(tableId);
         if (table == null) {
             if (!getConfig().getTableFilters().dataCollectionFilter().isIncluded(tableId)) {
@@ -912,16 +938,13 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
     }
 
     /**
-     * Resolves a table identifier by the event row's object id, consulting the schema's object-id
-     * registry first and falling back to a live {@code ALL_OBJECTS} lookup. Unresolvable object ids
-     * are negatively cached (upstream DBZ-8399 semantics) and handled according to the configured
-     * {@code event.processing.failure.handling.mode} (upstream DBZ-8208 semantics).
+     * Resolves a table identifier from the event row's object id using the registry only: LogMiner
+     * names every object that still exists, so an {@code OBJ#} row means the object is gone.
      *
      * @param row the result set row, should not be {@code null}
      * @return the resolved table identifier, or {@code null} if the event should be skipped
-     * @throws SQLException if a database exception occurred
      */
-    private TableId resolveTableIdByObjectId(LogMinerEventRow row) throws SQLException {
+    private TableId resolveTableIdByObjectId(LogMinerEventRow row) {
         final Long objectId = row.getObjectId() != 0 ? row.getObjectId() : null;
         final Long dataObjectId = row.getDataObjectId() != 0 ? row.getDataObjectId() : null;
         if (objectId != null) {
@@ -929,43 +952,65 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
             if (registered != null) {
                 return registered;
             }
-            if (!getSchema().isObjectIdUnresolvable(objectId)) {
-                // The object id has not been seen before; a table created after streaming started may
-                // not be registered yet, so attempt a live lookup. A dropped and purged object cannot
-                // be resolved this way and is negatively cached to avoid repeated lookups.
-                try (OracleConnection connection = createOutOfBandsConnection()) {
-                    final TableId resolved = connection.resolveTableIdByObjectId(objectId, row.getTableId().catalog());
-                    if (resolved != null) {
-                        getSchema().registerTableObjectId(resolved, objectId, dataObjectId);
-                        return resolved;
-                    }
-                }
-                getSchema().registerUnresolvableObjectId(objectId);
+        }
+        return handleUnresolvableObjectId(row, objectId);
+    }
+
+    /**
+     * Handles an event whose object id names no captured table.
+     * <p>
+     * Nothing separates another application's purged table from a captured table's own object id
+     * destroyed while the connector was not reading - a partition dropped, split, merged or exchanged,
+     * or a captured table purged and recreated - because a purged object keeps no owner or name. Such
+     * events are skipped unless the handling mode is {@code inherit}.
+     *
+     * @param row the result set row, should not be {@code null}
+     * @param objectId the object id, {@code null} when the row carries none
+     * @return {@code null} when the event is to be skipped
+     */
+    private TableId handleUnresolvableObjectId(LogMinerEventRow row, Long objectId) {
+        final boolean firstEncounter = objectId == null || getSchema().registerUnresolvableObjectId(objectId);
+
+        boolean reportAsWarning = OracleConnectorConfig.UnresolvableObjectIdHandlingMode.SKIP
+                .equals(connectorConfig.getUnresolvableObjectIdHandlingMode());
+        if (!reportAsWarning) {
+            switch (connectorConfig.getEventProcessingFailureHandlingMode()) {
+                case FAIL:
+                    LOGGER.error("Failed to resolve table name by object id lookup for event '{}'", row);
+                    throw new DebeziumException("Failed to resolve table name by object id " + objectId + " lookup");
+                case WARN:
+                    reportAsWarning = true;
+                    break;
+                default:
+                    break;
             }
         }
 
-        switch (connectorConfig.getEventProcessingFailureHandlingMode()) {
-            case FAIL:
-                LOGGER.error("Failed to resolve table name by object id lookup for event '{}'", row);
-                throw new DebeziumException("Failed to resolve table name by object id " + objectId + " lookup");
-            case WARN:
-                LOGGER.warn("Failed to resolve table name by object id {} lookup. The event '{}' will be ignored and skipped.", objectId, row);
-                metrics.incrementWarningCount();
-                return null;
-            default:
-                LOGGER.debug("Failed to resolve table name by object id {} lookup. The event '{}' will be ignored and skipped.", objectId, row);
-                return null;
+        unresolvableSkippedEvents++;
+        if (objectId != null) {
+            unresolvableSkippedObjectIds.add(objectId);
         }
+        if (reportAsWarning && firstEncounter) {
+            LOGGER.warn("Failed to resolve table name by object id {} lookup. The event '{}' will be ignored and skipped. "
+                    + "If this object was a captured table's, those changes are lost.", objectId, row);
+            metrics.incrementWarningCount();
+        }
+        else {
+            LOGGER.debug("Failed to resolve table name by object id {} lookup. The event '{}' will be ignored and skipped.", objectId, row);
+        }
+        return null;
     }
 
     /**
      * Creates a short-lived out-of-bands connection for lookups performed while the LogMiner result
      * set is being processed, positioned to the PDB when one is configured.
      *
+     * Overridable so tests can observe when a lookup reaches the database.
+     *
      * @return the connection, never {@code null}; the caller is responsible for closing it
      * @throws SQLException if a database exception occurred
      */
-    private OracleConnection createOutOfBandsConnection() throws SQLException {
+    protected OracleConnection createOutOfBandsConnection() throws SQLException {
         final OracleConnection connection = new OracleConnection(connectorConfig.getJdbcConfig(), () -> getClass().getClassLoader(), false);
         final String pdbName = getConfig().getPdbName();
         if (pdbName != null) {

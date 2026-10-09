@@ -505,6 +505,20 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
             .withValidation(Field::isPositiveInteger)
             .withDescription("The maximum number of entries in the object-id-to-table-id negative lookup cache used by the hybrid mining strategy.");
 
+    public static final Field LOG_MINING_UNRESOLVABLE_OBJECT_ID_HANDLING_MODE = Field.createInternal("log.mining.unresolvable.object.id.handling.mode")
+            .withDisplayName("Unresolvable object id handling")
+            .withEnum(UnresolvableObjectIdHandlingMode.class, UnresolvableObjectIdHandlingMode.SKIP)
+            .withWidth(Width.SHORT)
+            .withImportance(Importance.LOW)
+            .withDescription("Specifies what the hybrid mining strategy does with a change event whose Oracle object id "
+                    + "cannot be resolved to any table, which happens when an object is dropped and purged while its redo "
+                    + "has not been read yet." + System.lineSeparator()
+                    + "skip - the default, discards the event and logs it. A purged object carries nothing that identifies "
+                    + "its owner, so an object id of a captured table that was destroyed while the connector was not reading "
+                    + "- a partition dropped, split, merged or exchanged, or a captured table purged and recreated - is "
+                    + "discarded the same way, losing those changes." + System.lineSeparator()
+                    + "inherit - defers to event.processing.failure.handling.mode.");
+
     private static final ConfigDefinition CONFIG_DEFINITION = HistorizedRelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
             .name("Oracle")
             .excluding(
@@ -565,7 +579,8 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
                     LOG_MINING_SESSION_MAX_MS,
                     LOG_MINING_TRANSACTION_SNAPSHOT_BOUNDARY_MODE,
                     LOG_MINING_QUERY_TIMEOUT_MS,
-                    LOG_MINING_OBJECT_ID_CACHE_SIZE)
+                    LOG_MINING_OBJECT_ID_CACHE_SIZE,
+                    LOG_MINING_UNRESOLVABLE_OBJECT_ID_HANDLING_MODE)
             .create();
 
     /**
@@ -625,6 +640,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
     private final TransactionSnapshotBoundaryMode logMiningTransactionSnapshotBoundaryMode;
     private final Integer logMiningQueryTimeoutMs;
     private final int logMiningObjectIdCacheSize;
+    private final UnresolvableObjectIdHandlingMode unresolvableObjectIdHandlingMode;
 
     public OracleConnectorConfig(Configuration config) {
         super(OracleConnector.class, config, config.getString(SERVER_NAME), new SystemTablesPredicate(config),
@@ -675,6 +691,8 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
         this.logMiningTransactionSnapshotBoundaryMode = TransactionSnapshotBoundaryMode.parse(config.getString(LOG_MINING_TRANSACTION_SNAPSHOT_BOUNDARY_MODE));
         this.logMiningQueryTimeoutMs = config.getInteger(LOG_MINING_QUERY_TIMEOUT_MS);
         this.logMiningObjectIdCacheSize = config.getInteger(LOG_MINING_OBJECT_ID_CACHE_SIZE);
+        this.unresolvableObjectIdHandlingMode = UnresolvableObjectIdHandlingMode
+                .parse(config.getString(LOG_MINING_UNRESOLVABLE_OBJECT_ID_HANDLING_MODE), LOG_MINING_UNRESOLVABLE_OBJECT_ID_HANDLING_MODE.defaultValueAsString());
     }
 
     private static String toUpperCase(String property) {
@@ -1104,6 +1122,47 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
             }
 
             return mode;
+        }
+    }
+
+    /**
+     * What the hybrid mining strategy does with an event whose object id resolves to no table at all.
+     * A purged object keeps no owner or name, so the connector cannot tell whose it was.
+     */
+    public enum UnresolvableObjectIdHandlingMode implements EnumeratedValue {
+
+        /** Defer to {@code event.processing.failure.handling.mode}. */
+        INHERIT("inherit"),
+
+        /** Discard the event. May discard changes to a captured table, see the property description. */
+        SKIP("skip");
+
+        private final String value;
+
+        UnresolvableObjectIdHandlingMode(String value) {
+            this.value = value;
+        }
+
+        @Override
+        public String getValue() {
+            return value;
+        }
+
+        public static UnresolvableObjectIdHandlingMode parse(String value) {
+            if (value == null) {
+                return null;
+            }
+            for (UnresolvableObjectIdHandlingMode mode : values()) {
+                if (mode.getValue().equalsIgnoreCase(value.trim())) {
+                    return mode;
+                }
+            }
+            return null;
+        }
+
+        public static UnresolvableObjectIdHandlingMode parse(String value, String defaultValue) {
+            final UnresolvableObjectIdHandlingMode mode = parse(value);
+            return mode == null && defaultValue != null ? parse(defaultValue) : mode;
         }
     }
 
@@ -1548,6 +1607,10 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
      */
     public int getLogMiningObjectIdCacheSize() {
         return logMiningObjectIdCacheSize;
+    }
+
+    public UnresolvableObjectIdHandlingMode getUnresolvableObjectIdHandlingMode() {
+        return unresolvableObjectIdHandlingMode;
     }
 
     @Override

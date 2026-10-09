@@ -11,6 +11,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.config.Configuration;
+import io.debezium.connector.oracle.OracleConnection;
 import io.debezium.connector.oracle.OracleConnectorConfig;
 import io.debezium.connector.oracle.OracleConnectorConfig.LogMiningBufferType;
 import io.debezium.connector.oracle.junit.SkipWhenAdapterNameIsNot;
@@ -42,6 +43,12 @@ public class MemoryProcessorTest extends AbstractProcessorUnitTest<MemoryLogMine
                 partition,
                 offsetContext,
                 schema,
-                metrics);
+                metrics) {
+            @Override
+            protected OracleConnection createOutOfBandsConnection() {
+                outOfBandConnections++;
+                return connection;
+            }
+        };
     }
 }

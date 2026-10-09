@@ -691,24 +691,6 @@ public class OracleConnection extends JdbcConnection {
     }
 
     /**
-     * Resolves the owning table of the given Oracle object id from {@code ALL_OBJECTS}.
-     *
-     * Note that a dropped and purged object no longer exists in {@code ALL_OBJECTS} and cannot be
-     * resolved by this method; such lookups return {@code null}.
-     *
-     * @param objectId the object id to resolve, should not be {@code null}
-     * @param catalogName the catalog name to associate with the resolved identifier
-     * @return the resolved table identifier, or {@code null} if the object id was not found
-     * @throws SQLException if a database exception occurred
-     */
-    public TableId resolveTableIdByObjectId(Long objectId, String catalogName) throws SQLException {
-        return prepareQueryAndMap(
-                "SELECT OWNER, OBJECT_NAME FROM ALL_OBJECTS WHERE OBJECT_TYPE='TABLE' AND OBJECT_ID=?",
-                ps -> ps.setLong(1, objectId),
-                rs -> rs.next() ? new TableId(catalogName, rs.getString(1), rs.getString(2)) : null);
-    }
-
-    /**
      * Get the database character set used for {@code VARCHAR2}, {@code CHAR}, and {@code CLOB} data types.
      *
      * The database character set is set at database creation and does not change, so the result is

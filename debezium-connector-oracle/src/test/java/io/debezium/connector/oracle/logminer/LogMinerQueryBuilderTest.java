@@ -174,10 +174,9 @@ public class LogMinerQueryBuilderTest {
     @Test
     @FixFor({ "DBZ-3401", "DBZ-8926" })
     public void testLogMinerQueryWithTableIncludeUsingHybridStrategy() {
-        // Under the hybrid strategy the include-list predicate must also admit rows whose table
-        // name could not be resolved by LogMiner: dropped-and-purged objects ("OBJ# <n>") and
-        // dropped-but-not-purged recycle-bin objects ("BIN$...").
-        String table = "AND (TABLE_NAME LIKE 'OBJ#%' OR TABLE_NAME LIKE 'BIN$%' " +
+        // Under the hybrid strategy the include-list predicate must also admit dropped-and-purged
+        // objects ("OBJ# <n>"), but not recycle-bin objects ("BIN$..."), which upstream does not admit.
+        String table = "AND (TABLE_NAME LIKE 'OBJ#%' " +
                 "OR REGEXP_LIKE(SEG_OWNER || '.' || TABLE_NAME,'^DEBEZIUM\\.TABLEA$','i') " +
                 "OR REGEXP_LIKE(SEG_OWNER || '.' || TABLE_NAME,'^DEBEZIUM\\.TABLEB$','i')) ";
         Configuration config = TestHelper.defaultConfig()

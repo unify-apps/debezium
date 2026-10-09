@@ -347,10 +347,10 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
                     registered++;
                 }
                 else {
-                    // The table exists in the relational model but not in ALL_OBJECTS; it may have been
-                    // dropped since. Events for it can still be resolved lazily by object id if needed.
-                    LOGGER.warn("Could not resolve the object id for captured table {}; " +
-                            "hybrid strategy lookups for this table will rely on observed DDL events.", tableId);
+                    // Dropped and purged since the offset was written, so nothing can map its object id
+                    // back; its trailing events resolve to no table at all.
+                    LOGGER.warn("Captured table {} no longer exists in the database; events still carrying its object id "
+                            + "cannot be identified.", tableId);
                 }
             }
             LOGGER.info("Hybrid mining strategy: registered object ids for {} captured tables.", registered);

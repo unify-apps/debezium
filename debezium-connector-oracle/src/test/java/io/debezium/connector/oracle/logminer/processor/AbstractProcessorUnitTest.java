@@ -17,7 +17,10 @@ import java.sql.ResultSet;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.Collections;
+import java.util.concurrent.atomic.AtomicReference;
 
+import org.apache.kafka.connect.data.Struct;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -25,6 +28,7 @@ import org.junit.Test;
 import org.junit.rules.TestRule;
 import org.mockito.Mockito;
 
+import io.debezium.DebeziumException;
 import io.debezium.config.Configuration;
 import io.debezium.connector.base.ChangeEventQueue;
 import io.debezium.connector.oracle.CommitScn;
@@ -34,6 +38,7 @@ import io.debezium.connector.oracle.OracleDatabaseSchema;
 import io.debezium.connector.oracle.OracleDefaultValueConverter;
 import io.debezium.connector.oracle.OracleOffsetContext;
 import io.debezium.connector.oracle.OraclePartition;
+import io.debezium.connector.oracle.OracleSchemaChangeEventEmitter;
 import io.debezium.connector.oracle.OracleStreamingChangeEventSourceMetrics;
 import io.debezium.connector.oracle.OracleTaskContext;
 import io.debezium.connector.oracle.OracleTopicSelector;
@@ -45,9 +50,11 @@ import io.debezium.connector.oracle.logminer.events.EventType;
 import io.debezium.connector.oracle.logminer.events.LogMinerEventRow;
 import io.debezium.connector.oracle.util.TestHelper;
 import io.debezium.embedded.AbstractConnectorTest;
+import io.debezium.junit.logging.LogInterceptor;
 import io.debezium.pipeline.DataChangeEvent;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.source.spi.ChangeEventSource.ChangeEventSourceContext;
+import io.debezium.pipeline.spi.SchemaChangeEventEmitter;
 import io.debezium.relational.Column;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
@@ -64,6 +71,10 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
     private static final String TRANSACTION_ID_1 = "1234567890";
     private static final String TRANSACTION_ID_2 = "9876543210";
 
+    private static final long PURGED_OBJECT_ID = 162002L;
+    private static final String CAPTURE_SET = "DEBEZIUM\\.TEST_TABLE";
+    private static final TableId CAPTURED_TABLE = TableId.parse("ORCLPDB1.DEBEZIUM.TEST_TABLE");
+
     @Rule
     public TestRule skipRule = new SkipTestDependingOnAdapterNameRule();
 
@@ -74,6 +85,7 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
     protected OraclePartition partition;
     protected OracleOffsetContext offsetContext;
     protected OracleConnection connection;
+    protected int outOfBandConnections;
 
     @Before
     @SuppressWarnings({ "unchecked" })
@@ -113,7 +125,7 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
 
     @Test
     public void testCacheIsEmpty() throws Exception {
-        final OracleConnectorConfig config = new OracleConnectorConfig(getConfig().build());
+        final OracleConnectorConfig config = new OracleConnectorConfig(getCapturedConfig().build());
         try (T processor = getProcessor(config)) {
             assertThat(processor.getTransactionCache().isEmpty()).isTrue();
         }
@@ -121,7 +133,7 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
 
     @Test
     public void testCacheIsNotEmptyWhenTransactionIsAdded() throws Exception {
-        final OracleConnectorConfig config = new OracleConnectorConfig(getConfig().build());
+        final OracleConnectorConfig config = new OracleConnectorConfig(getCapturedConfig().build());
         try (T processor = getProcessor(config)) {
             processor.handleStart(getStartLogMinerEventRow(Scn.valueOf(1L), TRANSACTION_ID_1));
             processor.handleDataEvent(getInsertLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1));
@@ -131,7 +143,7 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
 
     @Test
     public void testCacheIsEmptyWhenTransactionIsCommitted() throws Exception {
-        final OracleConnectorConfig config = new OracleConnectorConfig(getConfig().build());
+        final OracleConnectorConfig config = new OracleConnectorConfig(getCapturedConfig().build());
         final OraclePartition partition = new OraclePartition(config.getLogicalName());
         try (T processor = getProcessor(config)) {
             final LogMinerEventRow insertRow = getInsertLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1);
@@ -144,7 +156,7 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
 
     @Test
     public void testCacheIsEmptyWhenTransactionIsRolledBack() throws Exception {
-        final OracleConnectorConfig config = new OracleConnectorConfig(getConfig().build());
+        final OracleConnectorConfig config = new OracleConnectorConfig(getCapturedConfig().build());
         try (T processor = getProcessor(config)) {
             processor.handleStart(getStartLogMinerEventRow(Scn.valueOf(1L), TRANSACTION_ID_1));
             processor.handleDataEvent(getInsertLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1));
@@ -155,7 +167,7 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
 
     @Test
     public void testCacheIsNotEmptyWhenFirstTransactionIsRolledBack() throws Exception {
-        final OracleConnectorConfig config = new OracleConnectorConfig(getConfig().build());
+        final OracleConnectorConfig config = new OracleConnectorConfig(getCapturedConfig().build());
         try (T processor = getProcessor(config)) {
             processor.handleStart(getStartLogMinerEventRow(Scn.valueOf(1L), TRANSACTION_ID_1));
             processor.handleDataEvent(getInsertLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1));
@@ -170,7 +182,7 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
 
     @Test
     public void testCacheIsNotEmptyWhenSecondTransactionIsRolledBack() throws Exception {
-        final OracleConnectorConfig config = new OracleConnectorConfig(getConfig().build());
+        final OracleConnectorConfig config = new OracleConnectorConfig(getCapturedConfig().build());
         try (T processor = getProcessor(config)) {
             processor.handleStart(getStartLogMinerEventRow(Scn.valueOf(1L), TRANSACTION_ID_1));
             processor.handleDataEvent(getInsertLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1));
@@ -185,7 +197,7 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
 
     @Test
     public void testCalculateScnWhenTransactionIsCommitted() throws Exception {
-        final OracleConnectorConfig config = new OracleConnectorConfig(getConfig().build());
+        final OracleConnectorConfig config = new OracleConnectorConfig(getCapturedConfig().build());
         final OraclePartition partition = new OraclePartition(config.getLogicalName());
         try (T processor = getProcessor(config)) {
             processor.handleStart(getStartLogMinerEventRow(Scn.valueOf(1L), TRANSACTION_ID_1));
@@ -198,7 +210,7 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
 
     @Test
     public void testCalculateScnWhenFirstTransactionIsCommitted() throws Exception {
-        final OracleConnectorConfig config = new OracleConnectorConfig(getConfig().build());
+        final OracleConnectorConfig config = new OracleConnectorConfig(getCapturedConfig().build());
         final OraclePartition partition = new OraclePartition(config.getLogicalName());
         try (T processor = getProcessor(config)) {
             processor.handleStart(getStartLogMinerEventRow(Scn.valueOf(1L), TRANSACTION_ID_1));
@@ -217,7 +229,7 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
 
     @Test
     public void testCalculateScnWhenSecondTransactionIsCommitted() throws Exception {
-        final OracleConnectorConfig config = new OracleConnectorConfig(getConfig().build());
+        final OracleConnectorConfig config = new OracleConnectorConfig(getCapturedConfig().build());
         final OraclePartition partition = new OraclePartition(config.getLogicalName());
         try (T processor = getProcessor(config)) {
             processor.handleStart(getStartLogMinerEventRow(Scn.valueOf(1L), TRANSACTION_ID_1));
@@ -237,7 +249,7 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
             return;
         }
 
-        final OracleConnectorConfig config = new OracleConnectorConfig(getConfig().build());
+        final OracleConnectorConfig config = new OracleConnectorConfig(getCapturedConfig().build());
         try (T processor = getProcessor(config)) {
             Mockito.when(offsetContext.getScn()).thenReturn(Scn.valueOf(1L));
 
@@ -255,7 +267,7 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
             return;
         }
 
-        final OracleConnectorConfig config = new OracleConnectorConfig(getConfig().build());
+        final OracleConnectorConfig config = new OracleConnectorConfig(getCapturedConfig().build());
         try (T processor = getProcessor(config)) {
             Mockito.when(offsetContext.getScn()).thenReturn(Scn.valueOf(1L));
 
@@ -271,8 +283,182 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
         }
     }
 
+    @Test
+    public void testRegisteredObjectIdStillResolvesUnderHybridStrategy() throws Exception {
+        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig().build());
+        try (T processor = getProcessor(config)) {
+            schema.registerTableObjectId(CAPTURED_TABLE, PURGED_OBJECT_ID, null);
+            final LogMinerEventRow row = getPurgedObjectLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1);
+
+            processor.handleDataEvent(row);
+
+            Mockito.verify(row).setTableId(CAPTURED_TABLE);
+            assertThat(processor.getTransactionCache().isEmpty()).isFalse();
+        }
+    }
+
+    @Test
+    public void testRegistryRejectsTableOutsideTheCaptureSet() {
+        final TableId foreign = TableId.parse("ORCLPDB1.SOMEONE_ELSE.FOREIGN_TABLE");
+
+        assertThat(schema.isCapturedTable(foreign)).isFalse();
+        assertThat(schema.registerTableObjectId(foreign, PURGED_OBJECT_ID, null)).isFalse();
+        assertThat(schema.getTableIdByObjectId(PURGED_OBJECT_ID, null)).isNull();
+    }
+
+    @Test
+    public void testRegistryAcceptsCapturedTable() {
+        final TableId captured = CAPTURED_TABLE;
+
+        assertThat(schema.isCapturedTable(captured)).isTrue();
+        assertThat(schema.registerTableObjectId(captured, PURGED_OBJECT_ID, null)).isTrue();
+        assertThat(schema.getTableIdByObjectId(PURGED_OBJECT_ID, null)).isEqualTo(captured);
+    }
+
+    /** A changed DATA_OBJECT_ID (truncate, move) must not answer from the stale entry. */
+    @Test
+    public void testDataObjectIdMismatchIsTreatedAsARegistryMiss() {
+        assertThat(schema.registerTableObjectId(CAPTURED_TABLE, PURGED_OBJECT_ID, 5L)).isTrue();
+
+        assertThat(schema.getTableIdByObjectId(PURGED_OBJECT_ID, 5L)).isEqualTo(CAPTURED_TABLE);
+        assertThat(schema.getTableIdByObjectId(PURGED_OBJECT_ID, 9L)).isNull();
+        assertThat(schema.getTableIdByObjectId(PURGED_OBJECT_ID, null)).isEqualTo(CAPTURED_TABLE);
+    }
+
+    @Test
+    public void testRegisteringTableObjectIdClearsAPriorUnresolvableRecord() {
+        assertThat(schema.registerUnresolvableObjectId(PURGED_OBJECT_ID)).isTrue();
+        assertThat(schema.registerUnresolvableObjectId(PURGED_OBJECT_ID)).isFalse();
+
+        assertThat(schema.registerTableObjectId(CAPTURED_TABLE, PURGED_OBJECT_ID, null)).isTrue();
+
+        assertThat(schema.isObjectIdUnresolvable(PURGED_OBJECT_ID)).isFalse();
+    }
+
+    @Test
+    public void testUnresolvableObjectIdCacheIsBounded() throws Exception {
+        final int cacheSize = new OracleConnectorConfig(getCapturedConfig().build()).getLogMiningObjectIdCacheSize();
+        for (long objectId = 1L; objectId <= cacheSize + 10L; objectId++) {
+            schema.registerUnresolvableObjectId(objectId);
+        }
+
+        assertThat(schema.isObjectIdUnresolvable(1L)).isFalse();
+        assertThat(schema.isObjectIdUnresolvable(cacheSize + 10L)).isTrue();
+    }
+
+    /**
+     * The production failure: another application's purged table must not stop the connector, a miss
+     * must never reach the database, and every discarded event must be warned about and counted.
+     */
+    @Test
+    public void testUnresolvableObjectIdIsSkippedByDefault() throws Exception {
+        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig().build());
+        assertThat(config.getUnresolvableObjectIdHandlingMode()).isEqualTo(OracleConnectorConfig.UnresolvableObjectIdHandlingMode.SKIP);
+        final LogInterceptor logs = new LogInterceptor(AbstractLogMinerEventProcessor.class);
+        try (T processor = getProcessor(config)) {
+            final int warningsBefore = metrics.getWarningCount();
+
+            for (int i = 0; i < 3; i++) {
+                processor.handleDataEvent(getPurgedObjectLogMinerEventRow(Scn.valueOf(2L + i), TRANSACTION_ID_1));
+            }
+            processor.processResults(partition, Mockito.mock(ResultSet.class));
+
+            assertThat(processor.getTransactionCache().isEmpty()).isTrue();
+            assertThat(metrics.getWarningCount()).isEqualTo(warningsBefore + 1);
+            assertThat(logs.containsWarnMessage("Failed to resolve table name by object id " + PURGED_OBJECT_ID)).isTrue();
+            assertThat(logs.containsWarnMessage("Skipped 3 change events across 1 unresolvable object ids")).isTrue();
+            assertThat(outOfBandConnections).isEqualTo(0);
+        }
+    }
+
+    @Test(expected = DebeziumException.class)
+    public void testInheritDefersToTheFailureHandlingMode() throws Exception {
+        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig()
+                .with("internal.log.mining.unresolvable.object.id.handling.mode", "inherit")
+                .build());
+        try (T processor = getProcessor(config)) {
+            processor.handleDataEvent(getPurgedObjectLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1));
+        }
+    }
+
+    /** Without the recycle-bin hole a dropped captured table's trailing rows die in Oracle; this is the only signal. */
+    @Test
+    public void testDroppingACapturedTableWarns() throws Exception {
+        Mockito.when(partition.getSourcePartition()).thenReturn(Collections.emptyMap());
+        Mockito.when(offsetContext.getOffset()).thenReturn(Collections.emptyMap());
+        Mockito.when(offsetContext.getSourceInfo()).thenReturn(Mockito.mock(Struct.class));
+
+        assertThat(dropTableWarns(CAPTURED_TABLE)).isTrue();
+        assertThat(dropTableWarns(TableId.parse("ORCLPDB1.DEBEZIUM.OTHER_T"))).isFalse();
+    }
+
+    /**
+     * End to end: a resolved event must be DISPATCHED under the resolved table, not merely parsed
+     * with it. Dispatch filters on the identifier the event carries, so an event emitted under
+     * "UNKNOWN.OBJ# <n>" is discarded no matter how correctly it was resolved and parsed.
+     */
+    @Test
+    public void testResolvedEventIsDispatchedUnderTheResolvedTable() throws Exception {
+        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig().build());
+        try (T processor = getProcessor(config)) {
+            schema.registerTableObjectId(CAPTURED_TABLE, PURGED_OBJECT_ID, null);
+            Mockito.when(offsetContext.getScn()).thenReturn(Scn.valueOf(1L));
+
+            processor.handleStart(getStartLogMinerEventRow(Scn.valueOf(1L), TRANSACTION_ID_1));
+            processor.handleDataEvent(getPurgedObjectLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1));
+            processor.handleCommit(partition, getCommitLogMinerEventRow(Scn.valueOf(3L), TRANSACTION_ID_1));
+
+            Mockito.verify(dispatcher).dispatchDataChangeEvent(Mockito.any(), Mockito.eq(CAPTURED_TABLE), Mockito.any());
+        }
+    }
+
+    /** A row LogMiner named correctly must not be rewritten. */
+    @Test
+    public void testNamedRowIdentityIsLeftAlone() throws Exception {
+        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig().build());
+        try (T processor = getProcessor(config)) {
+            final LogMinerEventRow row = getInsertLogMinerEventRow(Scn.valueOf(2L), TRANSACTION_ID_1);
+
+            processor.handleDataEvent(row);
+
+            Mockito.verify(row, Mockito.never()).setTableId(Mockito.any());
+        }
+    }
+
+    /** F5: a rename out of the capture set must not leave the object id pointing at the old table. */
+    @Test
+    public void testRenameOutOfTheCaptureSetDropsTheMapping() {
+        assertThat(schema.registerTableObjectId(CAPTURED_TABLE, PURGED_OBJECT_ID, null)).isTrue();
+
+        // The rename DDL re-registers the same object id under a name outside the capture set.
+        assertThat(schema.registerTableObjectId(TableId.parse("ORCLPDB1.DEBEZIUM.OTHER_T"), PURGED_OBJECT_ID, null)).isFalse();
+
+        assertThat(schema.getTableIdByObjectId(PURGED_OBJECT_ID, null)).isNull();
+    }
+
+    /** The schema and the processor must agree on the capture set; production never has them differ. */
+    private Configuration.Builder getCapturedConfig() {
+        return getConfig().with(OracleConnectorConfig.TABLE_INCLUDE_LIST, CAPTURE_SET);
+    }
+
+    private Configuration.Builder getHybridConfig() {
+        return getCapturedConfig().with(OracleConnectorConfig.LOG_MINING_STRATEGY, "hybrid");
+    }
+
+    private boolean dropTableWarns(TableId tableId) throws Exception {
+        final OracleConnectorConfig config = new OracleConnectorConfig(getHybridConfig().build());
+        final LogInterceptor logs = new LogInterceptor(OracleSchemaChangeEventEmitter.class);
+        final String ddl = "DROP TABLE " + tableId.schema() + "." + tableId.table() + ";";
+        final OracleSchemaChangeEventEmitter emitter = new OracleSchemaChangeEventEmitter(config, partition, offsetContext,
+                tableId, tableId.catalog(), tableId.schema(), ddl, schema, Instant.now(), metrics, () -> {
+                });
+        emitter.emitSchemaChangeEvent(Mockito.mock(SchemaChangeEventEmitter.Receiver.class));
+        return logs.containsWarnMessage("Captured table " + tableId + " was dropped");
+    }
+
+    /** An explicit capture set: the default configuration includes every table, so nothing is outside it. */
     private OracleDatabaseSchema createOracleDatabaseSchema() throws Exception {
-        final OracleConnectorConfig connectorConfig = new OracleConnectorConfig(getConfig().build());
+        final OracleConnectorConfig connectorConfig = new OracleConnectorConfig(getCapturedConfig().build());
         final TopicSelector<TableId> topicSelector = OracleTopicSelector.defaultSelector(connectorConfig);
         final SchemaNameAdjuster schemaNameAdjuster = connectorConfig.schemaNameAdjustmentMode().createAdjuster();
         final OracleValueConverters converters = new OracleValueConverters(connectorConfig, connection);
@@ -287,7 +473,7 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
                 sensitivity);
 
         Table table = Table.editor()
-                .tableId(TableId.parse("ORCLPDB1.DEBEZIUM.TEST_TABLE"))
+                .tableId(CAPTURED_TABLE)
                 .addColumn(Column.editor().name("ID").create())
                 .addColumn(Column.editor().name("DATA").create())
                 .create();
@@ -314,7 +500,7 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
     }
 
     private OracleStreamingChangeEventSourceMetrics createMetrics(OracleDatabaseSchema schema) throws Exception {
-        final OracleConnectorConfig connectorConfig = new OracleConnectorConfig(getConfig().build());
+        final OracleConnectorConfig connectorConfig = new OracleConnectorConfig(getCapturedConfig().build());
         final OracleTaskContext taskContext = new OracleTaskContext(connectorConfig, schema);
 
         final ChangeEventQueue<DataChangeEvent> queue = new ChangeEventQueue.Builder<DataChangeEvent>()
@@ -370,11 +556,27 @@ public abstract class AbstractProcessorUnitTest<T extends AbstractLogMinerEventP
         Mockito.when(row.getRowId()).thenReturn("1234567890");
         Mockito.when(row.getOperation()).thenReturn("INSERT");
         Mockito.when(row.getTableName()).thenReturn("TEST_TABLE");
-        Mockito.when(row.getTableId()).thenReturn(TableId.parse("ORCLPDB1.DEBEZIUM.TEST_TABLE"));
+        Mockito.when(row.getTableId()).thenReturn(CAPTURED_TABLE);
         Mockito.when(row.getRedoSql()).thenReturn("insert into \"DEBEZIUM\".\"TEST_TABLE\"(\"ID\",\"DATA\") values ('1','Test');");
         Mockito.when(row.getRsId()).thenReturn("A.B.C");
         Mockito.when(row.getTablespaceName()).thenReturn("DEBEZIUM");
         Mockito.when(row.getUserName()).thenReturn(TestHelper.SCHEMA_USER);
+        return row;
+    }
+
+    private LogMinerEventRow getPurgedObjectLogMinerEventRow(Scn scn, String transactionId) {
+        LogMinerEventRow row = getInsertLogMinerEventRow(scn, transactionId, Instant.now());
+        Mockito.when(row.getTableName()).thenReturn("OBJ# " + PURGED_OBJECT_ID);
+        Mockito.when(row.getTablespaceName()).thenReturn("UNKNOWN");
+        Mockito.when(row.getObjectId()).thenReturn(PURGED_OBJECT_ID);
+        // The real row is mutable and the event is dispatched under whatever it ends up holding, so a
+        // mock that ignored setTableId would hide exactly the defect these tests exist to catch.
+        final AtomicReference<TableId> identity = new AtomicReference<>(new TableId("ORCLPDB1", "UNKNOWN", "OBJ# " + PURGED_OBJECT_ID));
+        Mockito.when(row.getTableId()).thenAnswer(invocation -> identity.get());
+        Mockito.doAnswer(invocation -> {
+            identity.set(invocation.getArgument(0));
+            return null;
+        }).when(row).setTableId(Mockito.any());
         return row;
     }
 

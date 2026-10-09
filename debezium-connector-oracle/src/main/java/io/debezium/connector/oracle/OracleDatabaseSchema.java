@@ -57,13 +57,16 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
      * {@code ALL_OBJECTS} for all captured tables when streaming starts, updated as DDL events are
      * observed, and consulted on demand. Entries are intentionally never removed on DROP so trailing
      * DML events that precede the drop in the redo stream still resolve.
+     * <p>
+     * Unbounded, and only safe as such because registration rejects anything outside the capture set,
+     * which bounds it by the capture set's tables. A miss is not evidence that the
+     * object is foreign: ids destroyed while the connector was not reading can never be registered.
      */
     private final ConcurrentMap<Long, TableObjectId> objectIdToTableId = new ConcurrentHashMap<>();
 
     /**
-     * Bounded negative-lookup cache of object ids known to be unresolvable, preventing repeated
-     * database lookups for the same unknown object id (upstream DBZ-8399 semantics). Bounded by
-     * {@code internal.log.mining.object.id.cache.size} (upstream DBZ-8071).
+     * Bounded cache of object ids known to be unresolvable, so each is reported once rather than per
+     * event. Bounded by {@code internal.log.mining.object.id.cache.size} (upstream DBZ-8071).
      */
     private final Map<Long, Boolean> unresolvableObjectIds;
 
@@ -104,17 +107,38 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
 
     /**
      * Registers the Oracle object identifiers for a captured table.
+     * <p>
+     * A table outside the capture set is rejected rather than stored, keeping the unbounded registry
+     * sized by the capture set.
      *
      * @param tableId the relational table identifier, ignored if {@code null}
      * @param objectId the table's {@code OBJECT_ID}, ignored if {@code null}
      * @param dataObjectId the table's {@code DATA_OBJECT_ID}; may be {@code null} when unknown, in
      *            which case the entry matches lookups regardless of the requested data object id
+     * @return {@code true} if the identifiers were registered, {@code false} if the table is not
+     *         captured by this connector and was therefore not stored
      */
-    public void registerTableObjectId(TableId tableId, Long objectId, Long dataObjectId) {
-        if (tableId != null && objectId != null) {
-            objectIdToTableId.put(objectId, new TableObjectId(tableId, dataObjectId));
-            unresolvableObjectIds.remove(objectId);
+    public boolean registerTableObjectId(TableId tableId, Long objectId, Long dataObjectId) {
+        if (tableId == null || objectId == null) {
+            return false;
         }
+        if (!isCapturedTable(tableId)) {
+            // Object ids are unique, so naming this one outside the capture set means any mapping it
+            // still has - a rename out of the capture set leaves one - no longer describes it.
+            objectIdToTableId.remove(objectId);
+            return false;
+        }
+        objectIdToTableId.put(objectId, new TableObjectId(tableId, dataObjectId));
+        unresolvableObjectIds.remove(objectId);
+        return true;
+    }
+
+    /**
+     * @param tableId the table identifier, may be {@code null}
+     * @return {@code true} when the table matches the configured include/exclude lists
+     */
+    public boolean isCapturedTable(TableId tableId) {
+        return tableId != null && getTableFilter().isIncluded(tableId);
     }
 
     /**
@@ -144,12 +168,12 @@ public class OracleDatabaseSchema extends HistorizedRelationalDatabaseSchema {
     }
 
     /**
-     * Records that the given object id could not be resolved, so subsequent lookups fail fast.
+     * Records that the given object id could not be resolved.
+     *
+     * @return {@code true} the first time the object id is recorded, so callers report it once
      */
-    public void registerUnresolvableObjectId(Long objectId) {
-        if (objectId != null) {
-            unresolvableObjectIds.put(objectId, Boolean.TRUE);
-        }
+    public boolean registerUnresolvableObjectId(Long objectId) {
+        return objectId != null && unresolvableObjectIds.put(objectId, Boolean.TRUE) == null;
     }
 
     private static final class TableObjectId {

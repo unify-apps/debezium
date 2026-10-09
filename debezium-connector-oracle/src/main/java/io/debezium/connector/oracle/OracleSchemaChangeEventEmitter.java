@@ -185,6 +185,9 @@ public class OracleSchemaChangeEventEmitter implements SchemaChangeEventEmitter 
     }
 
     private SchemaChangeEvent dropTableEvent(OraclePartition partition, Table tableSchemaBeforeDrop, TableDroppedEvent event) {
+        if (filters.isIncluded(tableId)) {
+            LOGGER.warn("Captured table {} was dropped; changes to it still in flight at that point may not reach the destination.", tableId);
+        }
         // Intentionally no object-id registration: the pre-drop mapping must stay intact so trailing
         // DML events that precede the drop in the redo stream can still be resolved.
         offsetContext.tableEvent(tableId, changeTime);
@@ -208,9 +211,8 @@ public class OracleSchemaChangeEventEmitter implements SchemaChangeEventEmitter 
     private void registerTableObjectIds(TableId tableId) {
         if (objectId != null && connectorConfig.getAdapter() instanceof LogMinerAdapter) {
             if (OracleConnectorConfig.LogMiningStrategy.HYBRID.equals(connectorConfig.getLogMiningStrategy())) {
-                if (schema.tableFor(tableId) != null || filters.isIncluded(tableId)) {
-                    schema.registerTableObjectId(tableId, objectId, dataObjectId);
-                }
+                // The registry applies the capture-set test itself.
+                schema.registerTableObjectId(tableId, objectId, dataObjectId);
             }
         }
     }
