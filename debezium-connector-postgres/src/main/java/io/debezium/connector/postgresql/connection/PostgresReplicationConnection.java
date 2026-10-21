@@ -444,8 +444,8 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
                                 metronome.pause();
                             }
                             catch (InterruptedException e) {
-                                LOGGER.warn("Slot creation retry sleep interrupted by exception: {}", e.getMessage());
                                 Thread.currentThread().interrupt();
+                                throw new DebeziumException("Interrupted while waiting to retry replication slot creation", e);
                             }
                         }
                     }
