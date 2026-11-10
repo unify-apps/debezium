@@ -6,7 +6,10 @@
 package io.debezium.connector.oracle;
 
 import java.sql.SQLException;
+import java.sql.SQLRecoverableException;
+import java.sql.SQLTransientConnectionException;
 import java.util.List;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import org.apache.kafka.connect.source.SourceRecord;
@@ -14,6 +17,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.DebeziumException;
+import io.debezium.annotation.Immutable;
 import io.debezium.config.Configuration;
 import io.debezium.config.Field;
 import io.debezium.connector.base.ChangeEventQueue;
@@ -21,6 +25,7 @@ import io.debezium.connector.common.BaseSourceTask;
 import io.debezium.connector.oracle.StreamingAdapter.TableNameCaseSensitivity;
 import io.debezium.heartbeat.HeartbeatFactory;
 import io.debezium.jdbc.JdbcConfiguration;
+import io.debezium.jdbc.JdbcConnection;
 import io.debezium.pipeline.ChangeEventSourceCoordinator;
 import io.debezium.pipeline.DataChangeEvent;
 import io.debezium.pipeline.ErrorHandler;
@@ -29,6 +34,7 @@ import io.debezium.pipeline.spi.Offsets;
 import io.debezium.relational.TableId;
 import io.debezium.schema.TopicSelector;
 import io.debezium.util.Clock;
+import io.debezium.util.Collect;
 import io.debezium.util.SchemaNameAdjuster;
 import io.debezium.util.Strings;
 
@@ -37,9 +43,23 @@ public class OracleConnectorTask extends BaseSourceTask<OraclePartition, OracleO
     private static final Logger LOGGER = LoggerFactory.getLogger(OracleConnectorTask.class);
     private static final String CONTEXT_NAME = "oracle-connector-task";
 
+    /**
+     * Server-side codes meaning this session is gone. Driver-side failures (17410, 17008, 17002)
+     * are absent on purpose: ojdbc raises them as SQLRecoverableException, matched by type below --
+     * measured on ojdbc11 21.15, not assumed.
+     */
+    @Immutable
+    private static final Set<Integer> CONNECTION_LOST_ERROR_CODES = Collect.unmodifiableSet(
+            28, // your session has been killed
+            1012, // not logged on
+            2396, // exceeded maximum idle time, please connect again (DBZ-9280)
+            2399, // exceeded maximum connect time
+            3135); // connection lost contact
+
     private volatile OracleTaskContext taskContext;
     private volatile ChangeEventQueue<DataChangeEvent> queue;
     private volatile OracleConnection jdbcConnection;
+    private volatile OracleConnection heartbeatConnection;
     private volatile ErrorHandler errorHandler;
     private volatile OracleDatabaseSchema schema;
 
@@ -103,10 +123,7 @@ public class OracleConnectorTask extends BaseSourceTask<OraclePartition, OracleO
                         topicSelector,
                         schemaNameAdjuster,
                         () -> getHeartbeatConnection(connectorConfig, jdbcConfig),
-                        exception -> {
-                            final String sqlErrorId = exception.getMessage();
-                            throw new DebeziumException("Could not execute heartbeat action query (Error: " + sqlErrorId + ")", exception);
-                        }),
+                        exception -> handleHeartbeatError(exception, heartbeatConnection)),
                 schemaNameAdjuster);
 
         final OracleStreamingChangeEventSourceMetrics streamingMetrics = new OracleStreamingChangeEventSourceMetrics(taskContext, queue, metadataProvider,
@@ -132,7 +149,61 @@ public class OracleConnectorTask extends BaseSourceTask<OraclePartition, OracleO
         if (!Strings.isNullOrBlank(connectorConfig.getPdbName())) {
             connection.setSessionToPdb(connectorConfig.getPdbName());
         }
+        heartbeatConnection = connection;
         return connection;
+    }
+
+    static void handleHeartbeatError(SQLException exception, JdbcConnection connection) {
+        final SQLException lost = lostConnectionCause(exception);
+        if (lost != null) {
+            // A session Oracle has closed still answers isClosed() false, so isConnected() stays
+            // true and the dead handle is reused for ever. Closing it is what lets connection()
+            // re-establish on the next heartbeat.
+            LOGGER.warn("Heartbeat action query lost its database connection (ORA-{}): {}. Closing it; "
+                    + "the next heartbeat opens a new session.", lost.getErrorCode(), lost.getMessage());
+            closeLostConnection(connection);
+            return;
+        }
+        throw new DebeziumException("Could not execute heartbeat action query (Error: " + exception.getMessage() + ")", exception);
+    }
+
+    private static void closeLostConnection(JdbcConnection connection) {
+        if (connection == null) {
+            LOGGER.warn("No heartbeat connection to close; the next heartbeat creates one");
+            return;
+        }
+        try {
+            connection.close();
+            LOGGER.info("Closed the lost heartbeat connection");
+        }
+        catch (Exception e) {
+            // JdbcConnection.close() nulls its connection in a finally, so the next heartbeat
+            // re-establishes regardless; an unchecked failure must not escape the error handler.
+            LOGGER.warn("Could not close the lost heartbeat connection; the next heartbeat re-establishes anyway", e);
+        }
+    }
+
+    /**
+     * The throwable marking the connection lost, or null to let the error stay fatal. Returned
+     * rather than a boolean so the log names the code and message of the one that actually
+     * matched: the match is often a nested cause while the outer wrapper carries code 0.
+     */
+    static SQLException lostConnectionCause(SQLException exception) {
+        // Both contracts say a retry can succeed; SQLNonTransientConnectionException's says it cannot
+        // until the cause is corrected, so it is excluded. ORA-17002 arrives as SQLRecoverableException,
+        // so connect-time failures recover too -- deliberately: whether an unreachable database stops
+        // the connector is the main connection's call, not a liveness probe's.
+        Throwable throwable = exception;
+        while (throwable != null) {
+            if (throwable instanceof SQLRecoverableException
+                    || throwable instanceof SQLTransientConnectionException
+                    || (throwable instanceof SQLException
+                            && CONNECTION_LOST_ERROR_CODES.contains(((SQLException) throwable).getErrorCode()))) {
+                return (SQLException) throwable;
+            }
+            throwable = throwable.getCause();
+        }
+        return null;
     }
 
     @Override
